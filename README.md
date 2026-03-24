@@ -53,7 +53,7 @@ At least one action flag is required.
 - `--netcdf-dir PATH`: REF directory (required)
 - `--netcdf-dir-gliders PATH`: GLIDERS directory (optional)
 - `--netcdf-pattern GLOB`: file pattern under each netcdf dir (default `*.nc`)
-- `--aviso-dir PATH`: AVISO gridded directory (required) 
+- `--aviso-dir PATH`: AVISO gridded directory (required) (nrt_global_allsat_phy_l4_YYYYMMDD_YYYY1MM1DD1.nc)
 - `--mdt PATH`: MDT file path (required) (mdt_cnes_cls22_global.nc)
 - `--forecast-start YYYY-MM-DD`: optional fallback forecast start (used if folder inference fails)
 - `--lon-var NAME`: longitude variable name (default `longitude`)
