@@ -18,3 +18,7 @@ env/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Ignore alternate-width folders
+90W/
+94W/
