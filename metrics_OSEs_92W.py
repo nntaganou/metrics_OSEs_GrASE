@@ -294,7 +294,7 @@ def process_model_file_for_animation_core(
         lce_list = find_lce_region_contours(
             lon_model, lat_model, ssh_for_lce,
             lc_contour=contour_hycom_full,
-            level_min=0.17, level_max=0.17, num_levels=1,
+            # level_min=0.17, level_max=0.17, num_levels=1,
             min_lat=22.5, min_lon=-94.0, max_lon=-83.5
         )
         if len(lce_list) > 0:
@@ -321,7 +321,7 @@ def process_model_file_for_animation_core(
             lce_aviso_list = find_lce_region_contours(
                 lon_av, lat_av, ssh_aviso_for_lce,
                 lc_contour=contour_aviso_full,
-                level_min=0.17, level_max=0.17, num_levels=1,
+                # level_min=0.17, level_max=0.17, num_levels=1,
                 min_lat=22.5, min_lon=-94.0, max_lon=-83.5
             )
             if len(lce_aviso_list) > 0:
@@ -866,7 +866,7 @@ def create_animation_frame(
 def create_animation(
     results_ref: List[Dict],
     results_gliders: List[Dict],
-    output_file: str = "animation_mhd_jun03_with_mean_lce.mp4",
+    output_file: str = "animation_mhd_jun03_lc+lce.mp4",
     fps: int = 2,
     ref_label: str = "HYCOM_REF",
     gliders_label: str = "HYCOM_GLIDERS",
@@ -1046,12 +1046,35 @@ def compute_divergence_from_results(
     results: List[Dict],
     forecast_start: datetime,
     lon_cutoff: float = -81.0,
+    max_lead_days: Optional[int] = MAX_LEAD_DAYS,
 ) -> Optional[int]:
     """
     From a list of results (each with date, contour_hycom_full, contour_aviso_full),
     build (lead, max_lat) series for model and AVISO, find first detachment day each,
     return model_first - aviso_first (days), or None if either has no LCE.
     """
+    series_model, series_aviso = _build_max_lat_series_from_results(
+        results=results,
+        forecast_start=forecast_start,
+        lon_cutoff=lon_cutoff,
+        max_lead_days=max_lead_days,
+    )
+    series_model.sort(key=lambda x: x[0])
+    series_aviso.sort(key=lambda x: x[0])
+    first_model = first_detachment_day_from_max_lat_series(series_model)
+    first_aviso = first_detachment_day_from_max_lat_series(series_aviso)
+    if first_model is not None and first_aviso is not None:
+        return first_model - first_aviso
+    return None
+
+
+def _build_max_lat_series_from_results(
+    results: List[Dict],
+    forecast_start: datetime,
+    lon_cutoff: float = -81.0,
+    max_lead_days: Optional[int] = MAX_LEAD_DAYS,
+) -> Tuple[List[Tuple[int, float]], List[Tuple[int, float]]]:
+    """Build (lead, max_lat) series for model and AVISO from processed results."""
     series_model: List[Tuple[int, float]] = []
     series_aviso: List[Tuple[int, float]] = []
     for r in results:
@@ -1059,7 +1082,9 @@ def compute_divergence_from_results(
             continue
         date_obj = datetime.strptime(r["date"], "%Y%m%d")
         lead = (date_obj - forecast_start).days
-        if lead < 0 or lead > MAX_LEAD_DAYS:
+        if lead < 0:
+            continue
+        if max_lead_days is not None and lead > max_lead_days:
             continue
         ch = r.get("contour_hycom_full")
         ca = r.get("contour_aviso_full")
@@ -1077,11 +1102,19 @@ def compute_divergence_from_results(
                     series_aviso.append((lead, float(np.max(ca_c[:, 1]))))
     series_model.sort(key=lambda x: x[0])
     series_aviso.sort(key=lambda x: x[0])
-    first_model = first_detachment_day_from_max_lat_series(series_model)
-    first_aviso = first_detachment_day_from_max_lat_series(series_aviso)
-    if first_model is not None and first_aviso is not None:
-        return first_model - first_aviso
-    return None
+    return series_model, series_aviso
+
+
+def _max_drop_from_running_max(lead_max_lat: List[Tuple[int, float]]) -> float:
+    """Largest drop from running maximum in a (lead, max_lat) series."""
+    if len(lead_max_lat) < 2:
+        return 0.0
+    running_max = lead_max_lat[0][1]
+    max_drop = 0.0
+    for _, max_lat in lead_max_lat[1:]:
+        max_drop = max(max_drop, running_max - max_lat)
+        running_max = max(running_max, max_lat)
+    return float(max_drop)
 
 
 def plot_timeseries_all_forecasts(
@@ -1342,6 +1375,223 @@ def plot_timing_distribution(
         )
     else:
         print("No GLIDERS divergence values for timing distribution. Skip GLIDERS histogram.")
+
+
+def _sanitize_label_for_filename(label: str) -> str:
+    out = re.sub(r"[^A-Za-z0-9._-]+", "_", str(label)).strip("_")
+    return out or "simulation"
+
+
+def _style_for_multi_sim_label(label: str) -> Tuple[str, str]:
+    """Return (color, linestyle) for multi-simulation timeseries labels."""
+    name = str(label).lower()
+
+    colors = {
+        "tracks": "#1f77b4",
+        "swot": "#d62728",
+        "swot+tracks": "#2ca02c",
+    }
+    linestyles = {
+        "9d": "-",
+        "5d": "--",
+        "3d": ":",
+    }
+
+    if "swot+tracks" in name or "swottracks" in name:
+        color = colors["swot+tracks"]
+    elif "tracks" in name and "swot+" not in name and "swottracks" not in name:
+        color = colors["tracks"]
+    else:
+        color = colors["swot"]
+
+    if "9d" in name:
+        linestyle = linestyles["9d"]
+    elif "5d" in name:
+        linestyle = linestyles["5d"]
+    else:
+        linestyle = linestyles["3d"]
+
+    return color, linestyle
+
+
+def plot_timeseries_multi_simulation(
+    simulation_results: Dict[str, List[Dict]],
+    output_dir: str,
+    max_lead_days: Optional[int] = MAX_LEAD_DAYS,
+) -> None:
+    """Plot MHD lead-time timeseries for multiple simulations (one mean line per simulation)."""
+    if not simulation_results:
+        print("No simulation results to plot.")
+        return
+    fig, ax = plt.subplots(figsize=(14, 6))
+    any_plotted = False
+    for idx, (label, results) in enumerate(simulation_results.items()):
+        valid = [r for r in results if r.get("success") and r.get("date")]
+        if not valid:
+            continue
+        color, linestyle = _style_for_multi_sim_label(label)
+        by_fs = defaultdict(list)
+        for r in valid:
+            fs = r.get("forecast_start")
+            if fs is not None:
+                by_fs[fs].append(r)
+        lead_to_vals = defaultdict(list)
+        # Faint per-forecast lines
+        for fs, group in sorted(by_fs.items()):
+            leads, mhds = [], []
+            for r in group:
+                lead = r.get("lead_time_days")
+                if lead is None:
+                    date_obj = datetime.strptime(r["date"], "%Y%m%d")
+                    lead = (date_obj - fs).days
+                if lead >= 0 and (max_lead_days is None or lead <= max_lead_days):
+                    mhd_km = r["mhd"] * 111.0
+                    leads.append(lead)
+                    mhds.append(mhd_km)
+                    lead_to_vals[lead].append(mhd_km)
+            if leads:
+                s = sorted(zip(leads, mhds))
+                ax.plot(
+                    [x for x, _ in s],
+                    [y for _, y in s],
+                    linestyle,
+                    linewidth=1.2,
+                    color=color,
+                    alpha=0.2,
+                )
+        if lead_to_vals:
+            lead_sorted = sorted(lead_to_vals.keys())
+            mean_mhd = [np.mean(lead_to_vals[lt]) for lt in lead_sorted]
+            ax.plot(
+                lead_sorted,
+                mean_mhd,
+                linestyle,
+                linewidth=2.5,
+                color=color,
+                label=f"Mean ({label})",
+            )
+            any_plotted = True
+    ax.set_xlabel("Lead Time (days)", fontsize=11)
+    if max_lead_days is None:
+        observed = []
+        for results in simulation_results.values():
+            for r in results:
+                if not r.get("success") or r.get("date") is None:
+                    continue
+                fs = r.get("forecast_start")
+                if fs is None:
+                    continue
+                lead = r.get("lead_time_days")
+                if lead is None:
+                    date_obj = datetime.strptime(r["date"], "%Y%m%d")
+                    lead = (date_obj - fs).days
+                if lead >= 0:
+                    observed.append(lead)
+        ax.set_xlim(0, max(observed) if observed else MAX_LEAD_DAYS)
+    else:
+        ax.set_xlim(0, max_lead_days)
+    ax.set_ylabel("Modified Hausdorff Distance (km)", fontsize=11)
+    ax.set_title("MHD time series (all simulations, all forecasts)", fontsize=12, fontweight="bold")
+    ax.grid(True, alpha=0.3)
+    if any_plotted:
+        ax.legend(fontsize=8, ncol=2)
+    plt.tight_layout()
+    path = os.path.join(output_dir, "mhd_timeseries_all_simulations.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Wrote {path}")
+
+
+def plot_mean_std_multi_simulation(
+    simulation_results: Dict[str, List[Dict]],
+    output_dir: str,
+    max_lead_days: Optional[int] = MAX_LEAD_DAYS,
+) -> None:
+    """Plot mean ± std MHD vs lead time for multiple simulations on one figure."""
+    if not simulation_results:
+        print("No simulation results to plot.")
+        return
+    fig, ax = plt.subplots(figsize=(11, 7))
+    cmap = plt.get_cmap("tab10")
+    any_plotted = False
+    for idx, (label, results) in enumerate(simulation_results.items()):
+        lead_data = defaultdict(list)
+        for r in results:
+            if not r.get("success") or r.get("date") is None:
+                continue
+            fs = r.get("forecast_start")
+            if fs is None:
+                continue
+            lead = r.get("lead_time_days")
+            if lead is None:
+                date_obj = datetime.strptime(r["date"], "%Y%m%d")
+                lead = (date_obj - fs).days
+            if lead >= 0 and (max_lead_days is None or lead <= max_lead_days):
+                lead_data[lead].append(r["mhd"] * 111.0)
+        if not lead_data:
+            continue
+        color = cmap(idx % 10)
+        lead_sorted = sorted(lead_data.keys())
+        mean_vals = np.array([np.mean(lead_data[lt]) for lt in lead_sorted])
+        std_vals = np.array([np.std(lead_data[lt]) for lt in lead_sorted])
+        ax.fill_between(lead_sorted, mean_vals - std_vals, mean_vals + std_vals, color=color, alpha=0.14)
+        ax.plot(lead_sorted, mean_vals, "-", color=color, linewidth=2.2, label=label)
+        any_plotted = True
+    ax.set_xlabel("Lead Time (days)", fontsize=12)
+    if max_lead_days is None:
+        observed = []
+        for results in simulation_results.values():
+            for r in results:
+                if not r.get("success") or r.get("date") is None:
+                    continue
+                fs = r.get("forecast_start")
+                if fs is None:
+                    continue
+                lead = r.get("lead_time_days")
+                if lead is None:
+                    date_obj = datetime.strptime(r["date"], "%Y%m%d")
+                    lead = (date_obj - fs).days
+                if lead >= 0:
+                    observed.append(lead)
+        ax.set_xlim(0, max(observed) if observed else MAX_LEAD_DAYS)
+    else:
+        ax.set_xlim(0, max_lead_days)
+    ax.set_ylabel("Modified Hausdorff Distance (km)", fontsize=12)
+    ax.set_title("MHD: AVISO vs multiple simulations (mean ± std)", fontsize=14, fontweight="bold")
+    ax.set_ylim(0, 140)
+    ax.grid(True, alpha=0.3)
+    if any_plotted:
+        ax.legend(fontsize=9, ncol=2)
+    plt.tight_layout()
+    path = os.path.join(output_dir, "plot_mhd_timeseries_mean_std_multi.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Wrote {path}")
+
+
+def plot_timing_distribution_multi_simulation(
+    timing_by_sim: Dict[str, List[int]],
+    output_dir: str,
+) -> None:
+    """Write one timing histogram per simulation."""
+    if not timing_by_sim:
+        print("No timing data for multi-simulation histogram.")
+        return
+    cmap = plt.get_cmap("tab10")
+    for idx, (label, divergences) in enumerate(timing_by_sim.items()):
+        if not divergences:
+            print(f"No divergence values for timing distribution. Skip {label}.")
+            continue
+        safe = _sanitize_label_for_filename(label)
+        color = cmap(idx % 10)
+        _plot_one_timing_histogram(
+            divergences,
+            output_dir,
+            title=f"Distribution of first LCE detachment timing: {label} vs AVISO (all forecasts)",
+            xlabel=f"Divergence (days): {label} first LCE day − AVISO first LCE day",
+            filename=f"histogram_first_lce_divergence_aviso_{safe}.png",
+            color=color,
+        )
 
 
 def load_mhd_from_netcdf(path: str) -> Tuple[List[Dict], List[Dict]]:
@@ -1631,6 +1881,7 @@ if __name__ == "__main__":
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--hycom", action="store_true", help="Use HYCOM model data (paths in script)")
     mode.add_argument("--no-hycom", action="store_true", help="Use NetCDF model data (provide paths below)")
+    mode.add_argument("--multi-simulation", action="store_true", dest="multi_simulation", help="Use multiple NetCDF simulation directories (compare many simulations vs AVISO).")
     parser.add_argument("--animate", action="store_true", help="Produce MHD contour animation (MP4)")
     parser.add_argument("--animate-all", action="store_true", dest="animate_all", help="With --animate: produce one animation per forecast/group (HYCOM forecasts or NetCDF subfolders).")
     parser.add_argument("--timeseries", action="store_true", help="Produce MHD time series plot (all forecasts, date vs MHD)")
@@ -1638,6 +1889,8 @@ if __name__ == "__main__":
     parser.add_argument("--timing-distribution", action="store_true", help="Produce histogram of first LCE detachment timing (requires forecast start)")
     parser.add_argument("--netcdf-dir", type=str, help="[--no-hycom] Directory containing NetCDF SSH files (REF run)")
     parser.add_argument("--netcdf-dir-gliders", type=str, help="[--no-hycom] Optional: second directory for GLIDERS run")
+    parser.add_argument("--sim-dirs", nargs="+", default=None, help="[--multi-simulation] One or more simulation NetCDF directories.")
+    parser.add_argument("--sim-labels", nargs="+", default=None, help="[--multi-simulation] Optional labels for --sim-dirs (same order/length).")
     parser.add_argument("--netcdf-pattern", type=str, default="*.nc", help="[--no-hycom] Glob pattern for files (default: *.nc)")
     parser.add_argument("--aviso-dir", type=str, help="[--no-hycom] AVISO gridded directory")
     parser.add_argument("--mdt", type=str, help="[--no-hycom] Path to MDT NetCDF file")
@@ -1652,7 +1905,7 @@ if __name__ == "__main__":
     parser.add_argument("--mercator", action="store_true", help="[--no-hycom] Use area-weighted demean (requires --grid-netcdf with dx/dy or pscx/pscy)")
     parser.add_argument("--grid-dx-var", type=str, default="pscx", help="[--no-hycom] Grid NetCDF variable for cell x-size (default: pscx)")
     parser.add_argument("--grid-dy-var", type=str, default="pscy", help="[--no-hycom] Grid NetCDF variable for cell y-size (default: pscy)")
-    parser.add_argument("-o", "--output", type=str, default="animation_mhd_with_mean_lce.mp4", help="Output MP4 path (for --animate)")
+    parser.add_argument("-o", "--output", type=str, default="animation_mhd_lc+lce.mp4", help="Output MP4 path (for --animate)")
     parser.add_argument("--max-forecasts", type=int, default=None, metavar="N", help="[--hycom] Use at most N forecasts (for testing). Default: all.")
     args = parser.parse_args()
 
@@ -1937,6 +2190,258 @@ if __name__ == "__main__":
                         results_gliders = results_gliders_all
 
         ref_label, gliders_label = "HYCOM_REF", "HYCOM_GLIDERS"
+
+    elif args.multi_simulation:
+        # ---------------------------------------------------------------------
+        # Multi-simulation NetCDF: compare many simulation directories to AVISO
+        # ---------------------------------------------------------------------
+        if not args.sim_dirs or not args.aviso_dir or not args.mdt:
+            parser.error("--multi-simulation requires --sim-dirs, --aviso-dir, and --mdt")
+        if args.sim_labels is not None and len(args.sim_labels) != len(args.sim_dirs):
+            parser.error("--sim-labels must have the same length as --sim-dirs")
+        if getattr(args, "mercator", False) and not getattr(args, "grid_netcdf", None):
+            parser.error("--mercator requires --grid-netcdf (path to NetCDF grid file with cell sizes)")
+
+        need_animation = args.animate
+        sim_labels = args.sim_labels if args.sim_labels is not None else [os.path.basename(p.rstrip("/")) or f"sim_{i+1}" for i, p in enumerate(args.sim_dirs)]
+        fallback_fs = None
+        if args.forecast_start:
+            try:
+                fallback_fs = datetime.strptime(args.forecast_start, "%Y-%m-%d")
+            except ValueError:
+                print(f"Warning: --forecast-start {args.forecast_start} invalid (use YYYY-MM-DD). Ignoring fallback.")
+                fallback_fs = None
+
+        def collect_netcdf_file_date_pairs(nc_dir):
+            pattern = os.path.join(nc_dir, args.netcdf_pattern)
+            nc_files = sorted(glob.glob(pattern))
+            nc_files = [f for f in nc_files if os.path.isfile(f) and f.endswith(".nc")]
+            nc_files = [f for f in nc_files if os.path.basename(f) != "mhd_OSEs.nc"]
+            pairs = []
+            for f in nc_files:
+                date_str = extract_date_from_netcdf_path(f)
+                if date_str:
+                    pairs.append((f, date_str))
+            return pairs
+
+        def collect_netcdf_file_date_pairs_grouped(nc_dir):
+            grouped = defaultdict(list)
+            for f, date_str in collect_netcdf_file_date_pairs(nc_dir):
+                group_name = os.path.basename(os.path.dirname(f)) or "root"
+                grouped[group_name].append((f, date_str))
+            for key in grouped:
+                grouped[key] = sorted(grouped[key], key=lambda x: x[1])
+            return grouped
+
+        def infer_fs_from_pairs(pairs: List[Tuple[str, str]], fallback_dt: Optional[datetime]) -> Optional[datetime]:
+            """Infer forecast start from parent folder; fallback to earliest file date; then CLI fallback."""
+            if not pairs:
+                return fallback_dt
+            fs = infer_forecast_start_from_path(pairs[0][0])
+            if fs is not None:
+                return fs
+            try:
+                return datetime.strptime(min(d for _, d in pairs), "%Y%m%d")
+            except Exception:
+                return fallback_dt
+
+        simulation_results: Dict[str, List[Dict]] = {}
+        grouped_pairs_by_sim: Dict[str, Dict[str, List[Tuple[str, str]]]] = {}
+        for sim_dir, sim_label in zip(args.sim_dirs, sim_labels):
+            file_date_pairs = collect_netcdf_file_date_pairs(sim_dir)
+            if len(file_date_pairs) == 0:
+                print(f"Warning: No NetCDF files with date token found for simulation {sim_label} in {sim_dir}. Skipping.")
+                continue
+            print(f"[{sim_label}] Found {len(file_date_pairs)} NetCDF files")
+            sim_default_fs = infer_fs_from_pairs(file_date_pairs, fallback_fs)
+            if sim_default_fs is not None:
+                print(f"[{sim_label}] forecast_start used for grouping/timing: {sim_default_fs.strftime('%Y-%m-%d')}")
+            results = []
+            for i, (nc_path, date_str) in enumerate(file_date_pairs, 1):
+                if i % 10 == 0 or i == 1:
+                    print(f"  [{i}/{len(file_date_pairs)}] Processing {os.path.basename(nc_path)}...")
+                fs_for_file = infer_forecast_start_from_path(nc_path) or sim_default_fs
+                result = process_netcdf_file_for_animation(
+                    nc_path=nc_path, date=date_str,
+                    aviso_dir=args.aviso_dir, mdt_path=args.mdt,
+                    lon_var=args.lon_var, lat_var=args.lat_var, ssh_var=args.ssh_var,
+                    time_idx=0, ssh_scale=args.ssh_scale,
+                    lon_cutoff=lon_cutoff, use_cutoff=use_cutoff,
+                    grid_path_netcdf=getattr(args, "grid_netcdf", None),
+                    mercator=getattr(args, "mercator", False),
+                    grid_dx_var=getattr(args, "grid_dx_var", "pscx"),
+                    grid_dy_var=getattr(args, "grid_dy_var", "pscy"),
+                )
+                if fs_for_file is not None:
+                    result["forecast_start"] = fs_for_file
+                results.append(result)
+                sys.stdout.flush()
+            simulation_results[sim_label] = results
+            grouped_pairs_by_sim[sim_label] = collect_netcdf_file_date_pairs_grouped(sim_dir)
+
+        if not simulation_results:
+            print("Error: No simulation results were produced in --multi-simulation mode.")
+            sys.exit(1)
+
+        print("\n" + "=" * 60)
+        print("SUMMARY (MULTI-SIMULATION)")
+        print("=" * 60)
+        for label, results in simulation_results.items():
+            n_ok = sum(1 for r in results if r.get("success"))
+            print(f"{label}: {n_ok}/{len(results)} successful")
+
+        # In multi-simulation mode, use the maximum available lead from data (not fixed 90 days).
+        multi_max_lead_days = None
+        observed_leads = []
+        for results in simulation_results.values():
+            for r in results:
+                if not r.get("success") or r.get("date") is None:
+                    continue
+                fs = r.get("forecast_start")
+                if fs is None:
+                    continue
+                lead = r.get("lead_time_days")
+                if lead is None:
+                    date_obj = datetime.strptime(r["date"], "%Y%m%d")
+                    lead = (date_obj - fs).days
+                if lead >= 0:
+                    observed_leads.append(lead)
+        if observed_leads:
+            multi_max_lead_days = max(observed_leads)
+            print(f"[Multi-simulation] Using max lead days from data: {multi_max_lead_days}")
+
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        base_out = args.output if os.path.isabs(args.output) else os.path.join(OUTPUT_DIR, args.output)
+        base_stem, base_ext = os.path.splitext(base_out)
+
+        if need_animation:
+            if getattr(args, "animate_all", False):
+                for sim_label, grouped in grouped_pairs_by_sim.items():
+                    safe_label = _sanitize_label_for_filename(sim_label)
+                    print(f"[Animation – all groups] {sim_label}: {len(grouped)} group(s)")
+                    for grp_idx, group_name in enumerate(sorted(grouped.keys()), 1):
+                        pairs = grouped[group_name]
+                        if not pairs:
+                            continue
+                        group_fs = infer_fs_from_pairs(pairs, sim_default_fs)
+                        group_results = []
+                        for nc_path, date_str in pairs:
+                            result = process_netcdf_file_for_animation(
+                                nc_path=nc_path, date=date_str,
+                                aviso_dir=args.aviso_dir, mdt_path=args.mdt,
+                                lon_var=args.lon_var, lat_var=args.lat_var, ssh_var=args.ssh_var,
+                                time_idx=0, ssh_scale=args.ssh_scale,
+                                lon_cutoff=lon_cutoff, use_cutoff=use_cutoff,
+                                grid_path_netcdf=getattr(args, "grid_netcdf", None),
+                                mercator=getattr(args, "mercator", False),
+                                grid_dx_var=getattr(args, "grid_dx_var", "pscx"),
+                                grid_dy_var=getattr(args, "grid_dy_var", "pscy"),
+                            )
+                            if group_fs is not None:
+                                result["forecast_start"] = group_fs
+                            group_results.append(result)
+                        safe_group = _sanitize_label_for_filename(group_name) or f"group_{grp_idx:03d}"
+                        out_anim = f"{base_stem}_{safe_label}_{safe_group}{base_ext}"
+                        if any(r.get("success") for r in group_results):
+                            create_animation(
+                                results_ref=group_results,
+                                results_gliders=[],
+                                output_file=out_anim,
+                                fps=2,
+                                ref_label=sim_label,
+                                gliders_label="",
+                            )
+                        else:
+                            print(f"  Skip animation for {sim_label}/{group_name}: no valid results.")
+            else:
+                for sim_label, results in simulation_results.items():
+                    safe_label = _sanitize_label_for_filename(sim_label)
+                    out_anim = f"{base_stem}_{safe_label}{base_ext}"
+                    if any(r.get("success") for r in results):
+                        create_animation(
+                            results_ref=results,
+                            results_gliders=[],
+                            output_file=out_anim,
+                            fps=2,
+                            ref_label=sim_label,
+                            gliders_label="",
+                        )
+                    else:
+                        print(f"Skip animation for {sim_label}: no valid results.")
+
+        if args.timeseries:
+            plot_timeseries_multi_simulation(
+                simulation_results,
+                OUTPUT_DIR,
+                max_lead_days=multi_max_lead_days,
+            )
+        if args.mean_std:
+            plot_mean_std_multi_simulation(
+                simulation_results,
+                OUTPUT_DIR,
+                max_lead_days=multi_max_lead_days,
+            )
+        if args.timing_distribution:
+            timing_by_sim: Dict[str, List[int]] = {}
+            for sim_label, results in simulation_results.items():
+                by_fs = defaultdict(list)
+                for r in results:
+                    fs = r.get("forecast_start")
+                    if fs is not None:
+                        by_fs[fs].append(r)
+                divergences = []
+                n_groups = 0
+                n_both = 0
+                n_model_only = 0
+                n_aviso_only = 0
+                n_neither = 0
+                for fs, group in by_fs.items():
+                    n_groups += 1
+                    series_model, series_aviso = _build_max_lat_series_from_results(
+                        results=group,
+                        forecast_start=fs,
+                        lon_cutoff=lon_cutoff,
+                        max_lead_days=multi_max_lead_days,
+                    )
+                    first_model = first_detachment_day_from_max_lat_series(series_model)
+                    first_aviso = first_detachment_day_from_max_lat_series(series_aviso)
+                    if first_model is not None and first_aviso is not None:
+                        n_both += 1
+                        divergences.append(first_model - first_aviso)
+                    elif first_model is not None:
+                        n_model_only += 1
+                    elif first_aviso is not None:
+                        n_aviso_only += 1
+                    else:
+                        n_neither += 1
+
+                    if first_model is None or first_aviso is None:
+                        model_drop = _max_drop_from_running_max(series_model)
+                        aviso_drop = _max_drop_from_running_max(series_aviso)
+                        valid_dates = sorted(
+                            r["date"] for r in group if r.get("success") and r.get("date") is not None
+                        )
+                        d0 = valid_dates[0] if valid_dates else "NA"
+                        d1 = valid_dates[-1] if valid_dates else "NA"
+                        lm = f"{series_model[0][0]}-{series_model[-1][0]}" if series_model else "NA"
+                        la = f"{series_aviso[0][0]}-{series_aviso[-1][0]}" if series_aviso else "NA"
+                        print(
+                            f"[Timing diag] {sim_label} fs={fs.strftime('%Y-%m-%d')} dates={d0}->{d1} "
+                            f"model_pts={len(series_model)} aviso_pts={len(series_aviso)} "
+                            f"model_leads={lm} aviso_leads={la} "
+                            f"first_model={first_model} first_aviso={first_aviso} "
+                            f"max_drop_model={model_drop:.2f} max_drop_aviso={aviso_drop:.2f} "
+                            f"threshold={LC_NORTH_DROP_DEGREES:.2f}"
+                        )
+                timing_by_sim[sim_label] = divergences
+                print(
+                    f"[Timing summary] {sim_label}: groups={n_groups}, both={n_both}, "
+                    f"model_only={n_model_only}, aviso_only={n_aviso_only}, neither={n_neither}, "
+                    f"divergences={len(divergences)}"
+                )
+            plot_timing_distribution_multi_simulation(timing_by_sim, OUTPUT_DIR)
+
+        sys.exit(0)
 
     else:
         # ---------------------------------------------------------------------

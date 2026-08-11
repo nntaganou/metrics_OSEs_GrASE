@@ -26,6 +26,7 @@ def find_lce_region_contours(
     min_lon: float = -90.0,  # Minimum longitude (west boundary)
     max_lon: float = -83.5,   # Maximum longitude (east boundary)
     min_lat_span: float = 1.0,  # Contour lat extent must be > this (degrees) to count as LCE
+    min_lon_span: float = 1.3,  # Contour lon extent must be > this (degrees) to count as LCE
 ) -> List[np.ndarray]:
     """
     Find all contours in the LCE region (16-18 cm range) where 100% of points are in the region
@@ -80,6 +81,9 @@ def find_lce_region_contours(
                 continue
             lat_span = np.nanmax(lats) - np.nanmin(lats)
             if lat_span < min_lat_span:
+                continue
+            lon_span = np.nanmax(lons) - np.nanmin(lons)
+            if lon_span < min_lon_span:
                 continue
             lce_region_contours.append(seg)
 
