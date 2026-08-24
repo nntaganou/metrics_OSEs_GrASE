@@ -18,7 +18,9 @@ METRICS_SCRIPT = os.path.join(SCRIPT_DIR, "metrics_OSEs_92W.py")
 #    "--no-hycom",                 # Use NetCDF model paths instead of HYCOM
 #
 # --- Actions / outputs ---
-#    "--timeseries",               # Plot MHD timeseries (0–90 days)
+#    "--timeseries",               # Plot MHD timeseries vs lead time (0–90 days)
+#    "--timeseries-by-date",       # Plot MHD timeseries vs actual date (mean ± std across forecasts)
+#    "--no-lce",                   # Also produce LC-only (no LCE) versions of active plots; saves mhd_OSEs_lc_only.nc
 #    "--mean-std",                 # Plot mean±std MHD
 #    "--timing-distribution",      # Plot LCE timing distribution (histograms)
 #    "--animate",                  # Create animation for one forecast
@@ -77,21 +79,24 @@ METRICS_SCRIPT = os.path.join(SCRIPT_DIR, "metrics_OSEs_92W.py")
 #]
 
 DEFAULT_ARGS = [
-    "--no-hycom",
+    "--hycom",
+    #"--no-hycom",
     #"--timeseries",
+    "--timeseries-by-date",
+    "--no-lce",
     #"--mean-std",
-    "--timing-distribution",
-    "--animate","--animate-all",
-    "--model-label", "MODEL_no_grace",
-    "--model-label-gliders", "MODEL_grace",
+    #"--timing-distribution",
+    #"--animate","--animate-all",
+    #"--model-label", "MODEL_no_grace",
+    #"--model-label-gliders", "MODEL_grace",
     "--aviso-dir", "/gpfs/research/coaps/abozec/HYCOM2.3-TSIS/AVISO/GRIDDED",
     "--mdt", "/gpfs/research/coaps/abozec/HYCOM2.3-TSIS/AVISO/clim/mdt_cnes_cls22_global.nc",
-    "--netcdf-dir", "/gpfs/research/coaps/nntaganou/OSEs_GrASE/workdir/netcdf_test_nograse",
-    "--netcdf-dir-gliders", "/gpfs/research/coaps/nntaganou/OSEs_GrASE/workdir/netcdf_test_grase",
-    "--netcdf-pattern", "*/*.nc",
-    "--lon-var", "Longitude",             # e.g. "nav_lon", "lon"
-    "--lat-var", "Latitude",              # e.g. "nav_lat", "lat"
-    "--ssh-var", "ssh",
+    #"--netcdf-dir", "/gpfs/research/coaps/nntaganou/OSEs_GrASE/workdir/netcdf_test_nograse",
+    #"--netcdf-dir-gliders", "/gpfs/research/coaps/nntaganou/OSEs_GrASE/workdir/netcdf_test_grase",
+    #"--netcdf-pattern", "*/*.nc",
+    #"--lon-var", "Longitude",             # e.g. "nav_lon", "lon"
+    #"--lat-var", "Latitude",              # e.g. "nav_lat", "lat"
+    #"--ssh-var", "ssh",
     ]
 
 

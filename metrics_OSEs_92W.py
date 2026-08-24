@@ -400,21 +400,19 @@ def process_model_file_for_animation_core(
             result['contour_lce_aviso'] = contour_lce_aviso
         if result.get('contour_hycom_full') is not None or result.get('contour_aviso_full') is not None:
             result['success'] = True
+        # LC-only MHD (no LCE) — always computed for --no-lce output
+        result['mhd_lc_only'] = np.nan
+        if contour_hycom is not None and contour_aviso_f is not None and len(contour_hycom) > 0 and len(contour_aviso_f) > 0:
+            h_lc = clip_contours_to_lon_min(contour_hycom, MHD_LON_MIN)
+            a_lc = clip_contours_to_lon_min(contour_aviso_f, MHD_LON_MIN)
+            if len(h_lc) > 0 and len(a_lc) > 0:
+                result['mhd_lc_only'] = mhd(h_lc, a_lc, symmetric=True)
         # MHD when we have both sides and can compute; else NaN (contours still stored)
         if contour_hycom_full is not None and len(contour_hycom_full) > 0 and contour_aviso_full is not None and len(contour_aviso_full) > 0:
             if len(contour_hycom_for_mhd) > 0 and len(contour_aviso_for_mhd) > 0:
                 result['mhd'] = mhd(contour_hycom_for_mhd, contour_aviso_for_mhd, symmetric=True)
             else:
-                # LC only: use contours with just min lat 21, max lon -81, further clipped to east of 90W for the metric
-                if contour_hycom is not None and contour_aviso_f is not None and len(contour_hycom) > 0 and len(contour_aviso_f) > 0:
-                    h_lc = clip_contours_to_lon_min(contour_hycom, MHD_LON_MIN)
-                    a_lc = clip_contours_to_lon_min(contour_aviso_f, MHD_LON_MIN)
-                    if len(h_lc) > 0 and len(a_lc) > 0:
-                        result['mhd'] = mhd(h_lc, a_lc, symmetric=True)
-                    else:
-                        result['mhd'] = np.nan
-                else:
-                    result['mhd'] = np.nan
+                result['mhd'] = result['mhd_lc_only']
         else:
             result['mhd'] = np.nan
     except Exception:
@@ -1117,12 +1115,23 @@ def _max_drop_from_running_max(lead_max_lat: List[Tuple[int, float]]) -> float:
     return float(max_drop)
 
 
+def _lc_only_results(results: List[Dict]) -> List[Dict]:
+    """Return a copy of results with mhd replaced by mhd_lc_only, for LC-only plots."""
+    out = []
+    for r in results:
+        rc = dict(r)
+        rc['mhd'] = rc.get('mhd_lc_only', np.nan)
+        out.append(rc)
+    return out
+
+
 def plot_timeseries_all_forecasts(
     results_ref: List[Dict],
     results_gliders: List[Dict],
     output_dir: str,
     ref_label: str = "REF",
     gliders_label: str = "GLIDERS",
+    suffix: str = "",
 ) -> None:
     """Static plot: if results have 'forecast_start', plot lead time vs MHD (one line per forecast + mean). Else date vs MHD."""
     fig, ax = plt.subplots(figsize=(14, 6))
@@ -1198,7 +1207,86 @@ def plot_timeseries_all_forecasts(
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=9)
     plt.tight_layout()
-    path = os.path.join(output_dir, "mhd_timeseries_all_forecasts.png")
+    path = os.path.join(output_dir, f"mhd_timeseries_all_forecasts{suffix}.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Wrote {path}")
+
+
+def plot_timeseries_by_date(
+    results_ref: List[Dict],
+    results_gliders: List[Dict],
+    output_dir: str,
+    ref_label: str = "REF",
+    gliders_label: str = "GLIDERS",
+    suffix: str = "",
+) -> None:
+    """MHD vs actual date: one thin line per forecast, plus mean ± std shading across forecasts on each date."""
+
+    def _collect(results):
+        by_fs = defaultdict(list)    # forecast_start -> [(date, mhd_km)]
+        by_date = defaultdict(list)  # actual date    -> [mhd_km, ...]
+        for r in results:
+            if not r.get("success") or not r.get("date") or not np.isfinite(r.get("mhd", np.nan)):
+                continue
+            fs = r.get("forecast_start")
+            if fs is None:
+                continue
+            date_obj = datetime.strptime(r["date"], "%Y%m%d")
+            mhd_km = r["mhd"] * 111.0
+            by_fs[fs].append((date_obj, mhd_km))
+            by_date[date_obj].append(mhd_km)
+        return by_fs, by_date
+
+    ref_by_fs, ref_by_date = _collect(results_ref)
+    gl_by_fs, gl_by_date = _collect(results_gliders)
+
+    if not ref_by_date and not gl_by_date:
+        return
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    soft_blue = "#6BAED6"
+
+    for fs, pts in sorted(ref_by_fs.items()):
+        pts_s = sorted(pts)
+        ax.plot([p[0] for p in pts_s], [p[1] for p in pts_s],
+                "-", linewidth=1, color=soft_blue, alpha=0.5)
+
+    if ref_by_date:
+        dates_s = sorted(ref_by_date.keys())
+        mean_ref = [np.mean(ref_by_date[d]) for d in dates_s]
+        std_ref  = [np.std(ref_by_date[d])  for d in dates_s]
+        ax.plot(dates_s, mean_ref, "-", linewidth=2.5, color="steelblue",
+                label=f"Mean ({ref_label})", zorder=5)
+        ax.fill_between(dates_s,
+                        [m - s for m, s in zip(mean_ref, std_ref)],
+                        [m + s for m, s in zip(mean_ref, std_ref)],
+                        color="steelblue", alpha=0.2)
+
+    for fs, pts in sorted(gl_by_fs.items()):
+        pts_s = sorted(pts)
+        ax.plot([p[0] for p in pts_s], [p[1] for p in pts_s],
+                "-", linewidth=1, color="salmon", alpha=0.5)
+
+    if gl_by_date:
+        dates_s = sorted(gl_by_date.keys())
+        mean_gl = [np.mean(gl_by_date[d]) for d in dates_s]
+        std_gl  = [np.std(gl_by_date[d])  for d in dates_s]
+        ax.plot(dates_s, mean_gl, "-", linewidth=2.5, color="darkred",
+                label=f"Mean ({gliders_label})", zorder=5)
+        ax.fill_between(dates_s,
+                        [m - s for m, s in zip(mean_gl, std_gl)],
+                        [m + s for m, s in zip(mean_gl, std_gl)],
+                        color="salmon", alpha=0.2)
+
+    ax.set_xlabel("Date", fontsize=11)
+    ax.set_ylabel("Modified Hausdorff Distance (km)", fontsize=11)
+    ax.set_title("MHD vs actual date (mean ± std across forecasts)", fontsize=12, fontweight="bold")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=9)
+    plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha="right")
+    plt.tight_layout()
+    path = os.path.join(output_dir, f"mhd_timeseries_by_date{suffix}.png")
     plt.savefig(path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"Wrote {path}")
@@ -1211,6 +1299,7 @@ def plot_mean_std_from_results(
     output_dir: str,
     ref_label: str = "REF",
     gliders_label: str = "GLIDERS",
+    suffix: str = "",
 ) -> None:
     """Mean ± std MHD (km) vs lead time (days). Same logic as pycodes/plot_mhd_timeseries_mean_std: REF-only, GLIDERS-only, and both plots."""
     ref_data = defaultdict(list)
@@ -1256,7 +1345,7 @@ def plot_mean_std_from_results(
         ax.set_ylim(0, 140)
         ax.grid(True, alpha=0.3)
         plt.tight_layout()
-        path = os.path.join(output_dir, "plot_mhd_timeseries_mean_std_ref.png")
+        path = os.path.join(output_dir, f"plot_mhd_timeseries_mean_std_ref{suffix}.png")
         plt.savefig(path, dpi=150, bbox_inches="tight")
         plt.close()
         print(f"Wrote {path}")
@@ -1275,7 +1364,7 @@ def plot_mean_std_from_results(
         ax.set_ylim(0, 140)
         ax.grid(True, alpha=0.3)
         plt.tight_layout()
-        path = os.path.join(output_dir, "plot_mhd_timeseries_mean_std_gliders.png")
+        path = os.path.join(output_dir, f"plot_mhd_timeseries_mean_std_gliders{suffix}.png")
         plt.savefig(path, dpi=150, bbox_inches="tight")
         plt.close()
         print(f"Wrote {path}")
@@ -1300,7 +1389,7 @@ def plot_mean_std_from_results(
         ax.set_ylim(0, 140)
         ax.grid(True, alpha=0.3)
         plt.tight_layout()
-        path = os.path.join(output_dir, "plot_mhd_timeseries_mean_std_both.png")
+        path = os.path.join(output_dir, f"plot_mhd_timeseries_mean_std_both{suffix}.png")
         plt.savefig(path, dpi=150, bbox_inches="tight")
         plt.close()
         print(f"Wrote {path}")
@@ -1607,6 +1696,7 @@ def load_mhd_from_netcdf(path: str) -> Tuple[List[Dict], List[Dict]]:
                 n_ref = len(ds.dimensions["n_ref"])
                 date_var = ds.variables["ref_date"]
                 mhd_km = ds.variables["ref_mhd_km"][:]
+                mhd_lc_km = ds.variables["ref_mhd_lc_only_km"][:] if "ref_mhd_lc_only_km" in ds.variables else None
                 fs_var = ds.variables["ref_forecast_start"]
                 lead_var = ds.variables["ref_lead_time_days"][:] if "ref_lead_time_days" in ds.variables else None
                 for i in range(n_ref):
@@ -1614,6 +1704,7 @@ def load_mhd_from_netcdf(path: str) -> Tuple[List[Dict], List[Dict]]:
                     if not date_str:
                         continue
                     mhd_deg = float(mhd_km[i]) / 111.0
+                    mhd_lc_deg = float(mhd_lc_km[i]) / 111.0 if mhd_lc_km is not None else np.nan
                     fs_str = (fs_var[i, :].tobytes().decode("ascii", errors="ignore") if hasattr(fs_var[i, :], "tobytes") else "".join(str(c) for c in fs_var[i, :])).strip()
                     fs_dt = datetime.strptime(fs_str[:10], "%Y-%m-%d") if (fs_str and len(fs_str) >= 10 and fs_str[:10].replace("-", "").isdigit()) else None
                     lead_val = int(lead_var[i]) if lead_var is not None and i < len(lead_var) else None
@@ -1623,7 +1714,7 @@ def load_mhd_from_netcdf(path: str) -> Tuple[List[Dict], List[Dict]]:
                     if fs_dt is None and lead_days is not None:
                         date_obj = datetime.strptime(date_str, "%Y%m%d")
                         fs_dt = date_obj - timedelta(days=lead_days)
-                    rec = {"date": date_str, "mhd": mhd_deg, "forecast_start": fs_dt, "success": True}
+                    rec = {"date": date_str, "mhd": mhd_deg, "mhd_lc_only": mhd_lc_deg, "forecast_start": fs_dt, "success": True}
                     if lead_days is not None:
                         rec["lead_time_days"] = lead_days
                     ref_list.append(rec)
@@ -1631,6 +1722,7 @@ def load_mhd_from_netcdf(path: str) -> Tuple[List[Dict], List[Dict]]:
                 n_gl = len(ds.dimensions["n_gliders"])
                 date_var = ds.variables["gliders_date"]
                 mhd_km = ds.variables["gliders_mhd_km"][:]
+                mhd_lc_km = ds.variables["gliders_mhd_lc_only_km"][:] if "gliders_mhd_lc_only_km" in ds.variables else None
                 fs_var = ds.variables["gliders_forecast_start"]
                 lead_var = ds.variables["gliders_lead_time_days"][:] if "gliders_lead_time_days" in ds.variables else None
                 for i in range(n_gl):
@@ -1638,6 +1730,7 @@ def load_mhd_from_netcdf(path: str) -> Tuple[List[Dict], List[Dict]]:
                     if not date_str:
                         continue
                     mhd_deg = float(mhd_km[i]) / 111.0
+                    mhd_lc_deg = float(mhd_lc_km[i]) / 111.0 if mhd_lc_km is not None else np.nan
                     fs_str = (fs_var[i, :].tobytes().decode("ascii", errors="ignore") if hasattr(fs_var[i, :], "tobytes") else "".join(str(c) for c in fs_var[i, :])).strip()
                     fs_dt = datetime.strptime(fs_str[:10], "%Y-%m-%d") if (fs_str and len(fs_str) >= 10 and fs_str[:10].replace("-", "").isdigit()) else None
                     lead_val = int(lead_var[i]) if lead_var is not None and i < len(lead_var) else None
@@ -1647,7 +1740,7 @@ def load_mhd_from_netcdf(path: str) -> Tuple[List[Dict], List[Dict]]:
                     if fs_dt is None and lead_days is not None:
                         date_obj = datetime.strptime(date_str, "%Y%m%d")
                         fs_dt = date_obj - timedelta(days=lead_days)
-                    rec = {"date": date_str, "mhd": mhd_deg, "forecast_start": fs_dt, "success": True}
+                    rec = {"date": date_str, "mhd": mhd_deg, "mhd_lc_only": mhd_lc_deg, "forecast_start": fs_dt, "success": True}
                     if lead_days is not None:
                         rec["lead_time_days"] = lead_days
                     gliders_list.append(rec)
@@ -1694,6 +1787,8 @@ def save_mhd_to_netcdf(
             lead_ref.long_name = "lead time in days; -999 if unknown"
             mhd_ref = ds.createVariable("ref_mhd_km", "f4", "n_ref")
             mhd_ref.long_name = "modified Hausdorff distance (km)"
+            mhd_ref_lc = ds.createVariable("ref_mhd_lc_only_km", "f4", "n_ref")
+            mhd_ref_lc.long_name = "LC-only modified Hausdorff distance (km, no LCE)"
             for i, r in enumerate(ref_ok):
                 date_ref[i, :] = list(r["date"].ljust(8)[:8])
                 fs = r.get("forecast_start")
@@ -1706,6 +1801,7 @@ def save_mhd_to_netcdf(
                     fs_ref[i, :] = list("          ")
                     lead_ref[i] = fill_int
                 mhd_ref[i] = float(r["mhd"] * 111.0)
+                mhd_ref_lc[i] = float(r.get("mhd_lc_only", np.nan) * 111.0)
         if n_gliders > 0:
             ds.createDimension("n_gliders", n_gliders)
             date_gl = ds.createVariable("gliders_date", "S1", ("n_gliders", "date_strlen"))
@@ -1716,6 +1812,8 @@ def save_mhd_to_netcdf(
             lead_gl.long_name = "lead time in days; -999 if unknown"
             mhd_gl = ds.createVariable("gliders_mhd_km", "f4", "n_gliders")
             mhd_gl.long_name = "modified Hausdorff distance (km)"
+            mhd_gl_lc = ds.createVariable("gliders_mhd_lc_only_km", "f4", "n_gliders")
+            mhd_gl_lc.long_name = "LC-only modified Hausdorff distance (km, no LCE)"
             for i, r in enumerate(gliders_ok):
                 date_gl[i, :] = list(r["date"].ljust(8)[:8])
                 fs = r.get("forecast_start")
@@ -1728,6 +1826,7 @@ def save_mhd_to_netcdf(
                     fs_gl[i, :] = list("          ")
                     lead_gl[i] = fill_int
                 mhd_gl[i] = float(r["mhd"] * 111.0)
+                mhd_gl_lc[i] = float(r.get("mhd_lc_only", np.nan) * 111.0)
     print(f"Wrote {path} (REF: {n_ref}, GLIDERS: {n_gliders})")
 
 
@@ -1884,7 +1983,9 @@ if __name__ == "__main__":
     mode.add_argument("--multi-simulation", action="store_true", dest="multi_simulation", help="Use multiple NetCDF simulation directories (compare many simulations vs AVISO).")
     parser.add_argument("--animate", action="store_true", help="Produce MHD contour animation (MP4)")
     parser.add_argument("--animate-all", action="store_true", dest="animate_all", help="With --animate: produce one animation per forecast/group (HYCOM forecasts or NetCDF subfolders).")
-    parser.add_argument("--timeseries", action="store_true", help="Produce MHD time series plot (all forecasts, date vs MHD)")
+    parser.add_argument("--timeseries", action="store_true", help="Produce MHD time series plot (all forecasts, lead time vs MHD)")
+    parser.add_argument("--timeseries-by-date", action="store_true", dest="timeseries_by_date", help="Produce MHD time series vs actual date (mean ± std across forecasts)")
+    parser.add_argument("--no-lce", action="store_true", dest="no_lce", help="Also produce timeseries/mean-std plots using LC-only MHD (no LCE); saves mhd_OSEs_lc_only.nc")
     parser.add_argument("--mean-std", action="store_true", help="Produce mean ± std MHD vs lead time (requires forecast start)")
     parser.add_argument("--timing-distribution", action="store_true", help="Produce histogram of first LCE detachment timing (requires forecast start)")
     parser.add_argument("--netcdf-dir", type=str, help="[--no-hycom] Directory containing NetCDF SSH files (REF run)")
@@ -1909,7 +2010,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-forecasts", type=int, default=None, metavar="N", help="[--hycom] Use at most N forecasts (for testing). Default: all.")
     args = parser.parse_args()
 
-    if not (args.animate or args.timeseries or args.mean_std or args.timing_distribution):
+    if not (args.animate or args.timeseries or args.timeseries_by_date or args.no_lce or args.mean_std or args.timing_distribution):
         parser.error("At least one of --animate, --timeseries, --mean-std, --timing-distribution is required.")
     lon_cutoff = -81.0
     use_cutoff = True
@@ -1939,13 +2040,13 @@ if __name__ == "__main__":
             return files_ref, files_gliders, grid_file_ref, grid_file_gliders, aviso_dir, mdt_path, forecast_start
 
         need_animation = args.animate
-        need_rest = args.timeseries or args.mean_std or args.timing_distribution
+        need_rest = args.timeseries or args.timeseries_by_date or args.no_lce or args.mean_std or args.timing_distribution
         results_ref = []
         results_gliders = []
         forecast_start_dt = None
 
         # If we only need timing-distribution and an existing timing NetCDF is present, load it and skip HYCOM.
-        if args.timing_distribution and not (args.timeseries or args.mean_std or args.animate):
+        if args.timing_distribution and not (args.timeseries or args.timeseries_by_date or args.mean_std or args.animate):
             timing_nc_path = os.path.join(OUTPUT_DIR, "lce_timing_OSEs.nc")
             if os.path.isfile(timing_nc_path):
                 loaded_ref, loaded_gliders = load_lce_timing_from_netcdf(timing_nc_path)
@@ -2051,7 +2152,7 @@ if __name__ == "__main__":
                         print(f"  Date: {result['date']}, MHD: NaN (no east-of-90W overlap)")
                 sys.stdout.flush()
 
-        need_full_processing = args.timeseries or args.mean_std
+        need_full_processing = args.timeseries or args.timeseries_by_date or args.no_lce or args.mean_std
         if need_rest:
             configs = get_model_data_config_hycom_all()
             if getattr(args, "max_forecasts", None) is not None:
@@ -2452,7 +2553,7 @@ if __name__ == "__main__":
         if getattr(args, "mercator", False) and not getattr(args, "grid_netcdf", None):
             parser.error("--mercator requires --grid-netcdf (path to NetCDF grid file with cell sizes)")
         need_animation = args.animate
-        need_rest = args.timeseries or args.mean_std or args.timing_distribution
+        need_rest = args.timeseries or args.timeseries_by_date or args.no_lce or args.mean_std or args.timing_distribution
         forecast_start_dt = None
         if args.forecast_start:
             try:
@@ -2663,6 +2764,27 @@ if __name__ == "__main__":
         plot_timeseries_all_forecasts(
             ref_for_rest, gliders_for_rest, OUTPUT_DIR, ref_label=ref_label, gliders_label=gliders_label
         )
+    if args.timeseries_by_date:
+        plot_timeseries_by_date(
+            ref_for_rest, gliders_for_rest, OUTPUT_DIR, ref_label=ref_label, gliders_label=gliders_label
+        )
+    if args.no_lce:
+        lc_only_ref = _lc_only_results(ref_for_rest)
+        lc_only_gl = _lc_only_results(gliders_for_rest)
+        save_mhd_to_netcdf(lc_only_ref, lc_only_gl, OUTPUT_DIR, filename="mhd_OSEs_lc_only.nc")
+        if args.timeseries:
+            plot_timeseries_all_forecasts(
+                lc_only_ref, lc_only_gl, OUTPUT_DIR, ref_label=ref_label, gliders_label=gliders_label, suffix="_lc_only"
+            )
+        if args.timeseries_by_date:
+            plot_timeseries_by_date(
+                lc_only_ref, lc_only_gl, OUTPUT_DIR, ref_label=ref_label, gliders_label=gliders_label, suffix="_lc_only"
+            )
+        if args.mean_std:
+            plot_mean_std_from_results(
+                lc_only_ref, lc_only_gl, None, OUTPUT_DIR,
+                ref_label=ref_label, gliders_label=gliders_label, suffix="_lc_only",
+            )
     if args.mean_std:
         if results_ref_all is not None:
             plot_mean_std_from_results(
