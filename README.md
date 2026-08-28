@@ -16,8 +16,9 @@ Depending on flags, it can produce:
 - Mean +- std MHD vs lead time (`--mean-std`)
 - Timing distribution histograms (`--timing-distribution`)
 - Cached NetCDF outputs in `MHD_OUTPUT_DIR` (or current directory):
-  - `mhd_OSEs.nc`
-  - `lce_timing_OSEs.nc`
+  - `mhd_OSEs.nc` — full MHD (LC+LCE) timeseries
+  - `mhd_OSEs_lc_only.nc` — LC-only MHD timeseries
+  - `lce_timing_OSEs.nc` — first-detachment timing, separation timing, and detachment counts; **delete before rerunning if detection logic changes**
 
 ## 92W setting
 
@@ -40,12 +41,25 @@ To switch back to 90W:
 
 Exactly one mode is required.
 
-### Actions / outputs
+### Actions / outputs (full path — runs LCE detection, uses `mhd_OSEs.nc`)
 - `--animate`: create animation MP4
 - `--animate-all`: with `--animate`, create one MP4 per forecast/group
-- `--timeseries`: create `mhd_timeseries_all_forecasts.png`
-- `--mean-std`: create mean+-std plot(s)
-- `--timing-distribution`: create timing histograms
+- `--timeseries`: create `mhd_timeseries_all_forecasts.png` (lead-time, one line per forecast + mean±std)
+- `--timeseries-by-date`: create `mhd_timeseries_by_date.png` (actual date axis)
+- `--mean-std`: create mean±std plot(s) vs lead time
+- `--mean-std-by-date`: create mean±std plot vs actual date
+
+### Actions / outputs (light path — no full LCE detection, uses `lce_timing_OSEs.nc`)
+- `--timing-distribution`: histogram of first LCE detachment timing vs AVISO; bar label = days from forecast start to AVISO first detachment (per forecast window); saves `lce_timing_OSEs.nc`
+- `--separation-timing`: histogram of final LC separation timing vs AVISO (confirmed + uncertain); bar label = days from forecast start to AVISO final separation; saves `lce_timing_OSEs.nc`
+- `--detachment-count`: grouped bar chart of LCE detachment count per forecast (model vs AVISO); saves `lce_timing_OSEs.nc`
+- `--no-lce-timeseries`: LC-only MHD timeseries vs lead time (skips LCE detection); saves `mhd_OSEs_lc_only.nc`
+- `--no-lce-timeseries-by-date`: LC-only MHD timeseries vs actual date
+- `--no-lce-mean-std`: LC-only MHD mean±std vs lead time
+- `--no-lce-mean-std-by-date`: LC-only MHD mean±std vs actual date
+
+### LCE filter options
+- `--no-lon-span-filter`: disable the default `min_lon_span=1.3°` LCE filter (allow narrow LCEs)
 
 At least one action flag is required.
 
