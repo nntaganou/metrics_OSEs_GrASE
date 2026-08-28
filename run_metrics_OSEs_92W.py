@@ -20,16 +20,22 @@ METRICS_SCRIPT = os.path.join(SCRIPT_DIR, "metrics_OSEs_92W.py")
 # --- Actions / outputs ---
 #    "--timeseries",               # Plot MHD timeseries vs lead time (0–90 days)
 #    "--timeseries-by-date",       # Plot MHD timeseries vs actual date (mean ± std across forecasts)
-#    "--no-lce",                   # Also produce LC-only (no LCE) versions of active plots; saves mhd_OSEs_lc_only.nc
-#    "--mean-std",                 # Plot mean±std MHD
+#    "--no-lce-timeseries",        # LC-only MHD timeseries (no LCE detection); saves mhd_OSEs_lc_only.nc
+#    "--no-lce-timeseries-by-date",# LC-only MHD timeseries by date (no LCE detection); saves mhd_OSEs_lc_only.nc
+#    "--no-lce-mean-std",          # LC-only MHD mean±std (no LCE detection); saves mhd_OSEs_lc_only.nc
+#    "--mean-std-by-date",         # Plot MHD mean±std vs actual date
+#    "--no-lce-mean-std-by-date",  # LC-only MHD mean±std vs actual date (no LCE detection); saves mhd_OSEs_lc_only.nc
+#    "--mean-std",                 # Plot mean±std MHD vs lead time
+#    "--no-lon-span-filter",        # Disable min_lon_span=1.3° LCE filter (allow narrow LCEs)
 #    "--timing-distribution",      # Plot LCE timing distribution (histograms)
+#    "--detachment-count",          # Plot LCE detachment count per forecast (model vs AVISO bar chart)
 #    "--animate",                  # Create animation for one forecast
 #    "--animate-all",              # Create animations for all forecasts
 #    "--animate-forecast", "YYYY-MM-DD",   # Only animate this forecast (with --animate / --animate-all)
 #
 # --- Plot labels ---
-#    "--model-label", "Model",
-#    "--model-label-gliders", "Model_GLIDERS",
+#    "--model-label", "Model_no_grase",
+#    "--model-label-gliders", "Model_grase",
 #
 # --- Paths (AVISO / MDT) ---
 #    "--aviso-dir", "/path/to/AVISO/GRIDDED",
@@ -80,15 +86,22 @@ METRICS_SCRIPT = os.path.join(SCRIPT_DIR, "metrics_OSEs_92W.py")
 
 DEFAULT_ARGS = [
     "--hycom",
+    "--no-lon-span-filter",
     #"--no-hycom",
-    #"--timeseries",
+    "--timeseries",
+    "--no-lce-timeseries",
     "--timeseries-by-date",
-    "--no-lce",
-    #"--mean-std",
-    #"--timing-distribution",
+    "--no-lce-timeseries-by-date",
+    "--mean-std",
+    "--mean-std-by-date",
+    "--no-lce-mean-std",
+    "--no-lce-mean-std-by-date",
+    "--timing-distribution",
+    "--detachment-count",
+    "--separation-timing",
     #"--animate","--animate-all",
-    #"--model-label", "MODEL_no_grace",
-    #"--model-label-gliders", "MODEL_grace",
+    "--model-label", "no_GrASE_HYCOM",
+    "--model-label-gliders", "GrASE_HYCOM",
     "--aviso-dir", "/gpfs/research/coaps/abozec/HYCOM2.3-TSIS/AVISO/GRIDDED",
     "--mdt", "/gpfs/research/coaps/abozec/HYCOM2.3-TSIS/AVISO/clim/mdt_cnes_cls22_global.nc",
     #"--netcdf-dir", "/gpfs/research/coaps/nntaganou/OSEs_GrASE/workdir/netcdf_test_nograse",

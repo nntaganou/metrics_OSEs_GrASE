@@ -34,11 +34,13 @@ from loop_current_contour import (
     demean_region_netcdf_mercator,
     largest_contour_17cm,
     all_contours_17cm,
+    has_lce_17cm,
     get_aviso_contours_only,
     get_model_contour_from_ssh,
     load_aviso_sla_plus_mdt_on_aviso_grid,
 )
 from mhd import mhd
+from lce_contours import find_lce_region_contours
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -234,6 +236,7 @@ def process_model_file_for_animation_core(
     use_cutoff: bool = True,
     model_ssh_already_demeaned: bool = False,
     aviso_ssh_tuple: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
+    lce_min_lon_span: float = 1.3,
 ) -> Dict:
     """
     Compute LCE, MHD, and return result dict from already-loaded contours and SSH.
@@ -294,8 +297,9 @@ def process_model_file_for_animation_core(
         lce_list = find_lce_region_contours(
             lon_model, lat_model, ssh_for_lce,
             lc_contour=contour_hycom_full,
-            # level_min=0.17, level_max=0.17, num_levels=1,
-            min_lat=22.5, min_lon=-94.0, max_lon=-83.5
+            level_min=0.17, level_max=0.17, num_levels=1,
+            min_lat=22.5, min_lon=-94.0, max_lon=-83.5,
+            min_lon_span=lce_min_lon_span,
         )
         if len(lce_list) > 0:
             # Use largest LCE by area so REF/GLIDERS show one dominant eddy (avoids wrong shape from averaging multiple)
@@ -321,8 +325,9 @@ def process_model_file_for_animation_core(
             lce_aviso_list = find_lce_region_contours(
                 lon_av, lat_av, ssh_aviso_for_lce,
                 lc_contour=contour_aviso_full,
-                # level_min=0.17, level_max=0.17, num_levels=1,
-                min_lat=22.5, min_lon=-94.0, max_lon=-83.5
+                level_min=0.17, level_max=0.17, num_levels=1,
+                min_lat=22.5, min_lon=-94.0, max_lon=-83.5,
+                min_lon_span=lce_min_lon_span,
             )
             if len(lce_aviso_list) > 0:
                 contour_lce_aviso = largest_lce_contour(lce_aviso_list)
@@ -432,6 +437,7 @@ def process_hycom_file_for_animation(
     mdt_path: str,
     lon_cutoff: float = -81.0,
     use_cutoff: bool = True,
+    lce_min_lon_span: float = 1.3,
 ) -> Dict:
     """
     Process a single HYCOM file: load contours and SSH via HYCOM I/O, then run generic core.
@@ -486,6 +492,7 @@ def process_hycom_file_for_animation(
             use_cutoff=use_cutoff,
             model_ssh_already_demeaned=True,
             aviso_ssh_tuple=aviso_ssh_tuple,
+            lce_min_lon_span=lce_min_lon_span,
         )
     except Exception as e:
         print(f"  Error processing {os.path.basename(hycom_file)}: {e}")
@@ -586,6 +593,7 @@ def process_netcdf_file_for_animation(
     mercator: bool = False,
     grid_dx_var: str = "pscx",
     grid_dy_var: str = "pscy",
+    lce_min_lon_span: float = 1.3,
 ) -> Dict:
     """
     Process a single NetCDF file: load (lon, lat, ssh), demean (regular or area-weighted
@@ -662,6 +670,7 @@ def process_netcdf_file_for_animation(
             lon_cutoff=lon_cutoff,
             use_cutoff=use_cutoff,
             model_ssh_already_demeaned=True,
+            lce_min_lon_span=lce_min_lon_span,
         )
     except Exception as e:
         print(f"  Error processing {os.path.basename(nc_path)}: {e}")
@@ -972,32 +981,155 @@ def create_animation(
 def first_detachment_day_from_max_lat_series(
     lead_max_lat: List[Tuple[int, float]],
     drop_degrees: float = LC_NORTH_DROP_DEGREES,
+    lead_has_lce: Optional[Dict[int, bool]] = None,
 ) -> Optional[int]:
     """
     Given a sorted list of (lead_time, max_latitude), return the first lead day where
     max_lat drops by more than drop_degrees from the running maximum so far (detachment).
+    When lead_has_lce is provided, uses 0.5° threshold and also requires a new LCE to appear.
+    When both lce_now and lce_prev are False (no LCE activity), running_max is lowered to
+    max_lat so that a stale peak does not trigger a false detachment later.
     """
     if len(lead_max_lat) < 2:
         return None
+    use_lce = lead_has_lce is not None
+    threshold = 0.5 if use_lce else drop_degrees
     running_max = lead_max_lat[0][1]
+    prev_lead = lead_max_lat[0][0]
     for lead, max_lat in lead_max_lat[1:]:
-        if max_lat < running_max - drop_degrees:
+        if max_lat < running_max - threshold:
+            if use_lce:
+                lce_now = lead_has_lce.get(lead, False)
+                lce_prev = lead_has_lce.get(prev_lead, False)
+                if not (lce_now and not lce_prev):
+                    # No new LCE: lower running_max only when there is no LCE activity at
+                    # all (both False), so a stale peak cannot trigger a false detachment.
+                    # If lce_prev=True (LCE just disappeared) keep running_max high so a
+                    # reappearing LCE the next day still fires correctly.
+                    if not lce_now and not lce_prev:
+                        running_max = max_lat
+                    else:
+                        running_max = max(running_max, max_lat)
+                    prev_lead = lead
+                    continue
             return lead
         running_max = max(running_max, max_lat)
+        prev_lead = lead
     return None
 
 
-def process_hycom_file_for_timing_only(
+def count_detachments_from_max_lat_series(
+    lead_max_lat: List[Tuple[int, float]],
+    drop_degrees: float = LC_NORTH_DROP_DEGREES,
+    lead_has_lce: Optional[Dict[int, bool]] = None,
+) -> int:
+    """
+    Count all detachment events in a (lead_time, max_latitude) series.
+    A detachment is when max_lat drops more than drop_degrees from the running max.
+    After each detachment the running max resets to the current max_lat.
+    When lead_has_lce is provided, uses 1° threshold and also requires a new LCE to appear.
+    """
+    if len(lead_max_lat) < 2:
+        return 0
+    use_lce = lead_has_lce is not None
+    threshold = 0.5 if use_lce else drop_degrees
+    count = 0
+    running_max = lead_max_lat[0][1]
+    prev_lead = lead_max_lat[0][0]
+    for lead, max_lat in lead_max_lat[1:]:
+        if max_lat < running_max - threshold:
+            if use_lce:
+                lce_now = lead_has_lce.get(lead, False)
+                lce_prev = lead_has_lce.get(prev_lead, False)
+                if not (lce_now and not lce_prev):
+                    if not lce_now and not lce_prev:
+                        running_max = max_lat
+                    else:
+                        running_max = max(running_max, max_lat)
+                    prev_lead = lead
+                    continue
+            count += 1
+            running_max = max_lat
+        else:
+            running_max = max(running_max, max_lat)
+        prev_lead = lead
+    return count
+
+
+def detect_final_separation(
+    date_max_lat: List[Tuple[datetime, float]],
+    drop_degrees: float = 2.0,
+    recovery_days: int = 30,
+    date_has_lce: Optional[Dict[datetime, bool]] = None,
+) -> Tuple[Optional[datetime], bool]:
+    """
+    Detect the final LC separation from a (date, max_lat) time series.
+
+    Classic mode (date_has_lce is None):
+      drop >= drop_degrees (2°) with no latitude recovery within recovery_days.
+
+    LCE-assisted mode (date_has_lce provided):
+      Trigger: drop >= 0.5° + new LCE appeared (present now, absent previous step).
+      Confirmation over next recovery_days: latitude does not rise more than drop_degrees (2°)
+      above the trigger latitude AND LCE is continuously detected.
+
+    Returns (separation_date, is_confirmed):
+      is_confirmed=True  if >= recovery_days of data remain after the drop
+      is_confirmed=False if < recovery_days remain (uncertain)
+    Returns (None, False) if no qualifying drop is found.
+    """
+    if len(date_max_lat) < 2:
+        return None, False
+    series = sorted(date_max_lat, key=lambda x: x[0])
+    use_lce = date_has_lce is not None
+    drop_trigger = 0.5 if use_lce else drop_degrees
+    running_max = series[0][1]
+    i = 1
+    while i < len(series):
+        date, max_lat = series[i]
+        if max_lat < running_max - drop_trigger:
+            if use_lce:
+                # Require new LCE appeared at this step
+                prev_date = series[i - 1][0]
+                lce_now = date_has_lce.get(date, False)
+                lce_prev = date_has_lce.get(prev_date, False)
+                if not (lce_now and not lce_prev):
+                    running_max = max(running_max, max_lat)
+                    i += 1
+                    continue
+                # Confirm: within recovery_days, LC stays > 0.5° below pre-drop peak AND LCE persists
+                ahead = [(d, lat) for d, lat in series[i + 1:] if (d - date).days <= recovery_days]
+                lat_recovered = any(lat >= max_lat + drop_degrees for _, lat in ahead)
+                lce_continuous = all(date_has_lce.get(d, False) for d, _ in ahead)
+                if lat_recovered or not lce_continuous:
+                    i += 1
+                    continue
+            else:
+                # Classic: latitude must not recover within recovery_days
+                ahead = [(d, lat) for d, lat in series[i + 1:] if (d - date).days <= recovery_days]
+                if any(lat >= running_max - drop_degrees for _, lat in ahead):
+                    running_max = max_lat
+                    i += 1
+                    continue
+            last_date = series[-1][0]
+            days_remaining = (last_date - date).days
+            return date, days_remaining >= recovery_days
+        running_max = max(running_max, max_lat)
+        i += 1
+    return None, False
+
+
+def process_hycom_file_for_lc_only_mhd(
     hycom_file: str,
     grid_file: str,
     aviso_dir: str,
     mdt_path: str,
     forecast_start: datetime,
     lon_cutoff: float = -81.0,
-) -> Optional[Tuple[int, float, float]]:
+) -> Optional[Dict]:
     """
-    Lightweight: load LC contours only, filter/clip, return (lead_days, max_lat_model, max_lat_aviso).
-    No SSH load, no LCE detection, no MHD. Returns None if date/contours invalid.
+    Lightweight LC-only MHD: loads SSH and extracts LC contour at 17 cm, then computes MHD.
+    Skips LCE detection entirely. Returns result dict with mhd == mhd_lc_only.
     """
     date = extract_date_from_filename(hycom_file)
     if date is None:
@@ -1019,10 +1151,86 @@ def process_hycom_file_for_timing_only(
         contour_hycom, contour_aviso = clip_contours_to_longitude_cutoff(
             contour_hycom, contour_aviso, lon_cutoff=lon_cutoff
         )
+        if contour_hycom is None or contour_aviso is None:
+            return None
+        h_lc = clip_contours_to_lon_min(contour_hycom, MHD_LON_MIN)
+        a_lc = clip_contours_to_lon_min(contour_aviso, MHD_LON_MIN)
+        if len(h_lc) == 0 or len(a_lc) == 0:
+            return None
+        mhd_val = mhd(h_lc, a_lc, symmetric=True)
+        return {
+            'date': date,
+            'mhd': mhd_val,
+            'mhd_lc_only': mhd_val,
+            'forecast_start': forecast_start,
+            'lead_time_days': lead,
+            'success': True,
+        }
+    except Exception:
+        return None
+
+
+def process_hycom_file_for_timing_only(
+    hycom_file: str,
+    grid_file: str,
+    aviso_dir: str,
+    mdt_path: str,
+    forecast_start: datetime,
+    lon_cutoff: float = -81.0,
+    load_aviso: bool = True,
+    detect_lce: bool = False,
+    lce_min_lon_span: float = 1.3,
+    sep_min_lon: Optional[float] = None,
+    det_min_lon: Optional[float] = None,
+) -> Optional[Tuple]:
+    """
+    Lightweight: load LC contours only, filter/clip, return (lead, max_lat_model, max_lat_aviso[, has_lce_timing, has_lce_sep, has_lce_det]).
+    No MHD. Pass detect_lce=True to get LCE flags as elements 4-6:
+      has_lce_timing (4th): primary LCE, default box — for --timing-distribution
+      has_lce_sep    (5th): LCE with sep_min_lon west boundary — for --separation-timing
+      has_lce_det    (6th): LCE with det_min_lon west boundary — for --detachment-count
+    Returns None if date/contours invalid.
+    """
+    date = extract_date_from_filename(hycom_file)
+    if date is None:
+        return None
+    date_obj = datetime.strptime(date, "%Y%m%d")
+    lead = (date_obj - forecast_start).days
+    if lead < 0 or lead > MAX_LEAD_DAYS:
+        return None
+    try:
+        contour_hycom, contour_aviso = get_hycom_aviso_contours(
+            hycom_archv_file=hycom_file,
+            hycom_grid_file=grid_file,
+            date=date,
+            aviso_dir=aviso_dir,
+            mdt_path=mdt_path,
+            load_aviso=load_aviso,
+        )
+        contour_hycom = filter_contour_from_latitude(contour_hycom, 21.0) if contour_hycom is not None else None
+        contour_aviso = filter_contour_from_latitude(contour_aviso, 21.0) if contour_aviso is not None else None
+        contour_hycom, contour_aviso = clip_contours_to_longitude_cutoff(
+            contour_hycom, contour_aviso, lon_cutoff=lon_cutoff
+        )
         max_lat_model = float(np.max(contour_hycom[:, 1])) if contour_hycom is not None and len(contour_hycom) > 0 else None
         max_lat_aviso = float(np.max(contour_aviso[:, 1])) if contour_aviso is not None and len(contour_aviso) > 0 else None
-        if max_lat_model is None and max_lat_aviso is None:
+        if max_lat_model is None and (not load_aviso or max_lat_aviso is None):
             return None
+        if detect_lce:
+            try:
+                lon_h, lat_h, ssh_dm = load_ssh_and_grid_hycom(hycom_file, grid_file)
+                ssh_h = demean_region_hycom(ssh_dm / 10.0, lon_h, lat_h, grid_file, DEMEAN_BBOX)
+                _base = dict(level_min=0.17, level_max=0.17, num_levels=1, min_lon_span=lce_min_lon_span)
+                lce_timing_flag = len(find_lce_region_contours(lon_h, lat_h, ssh_h, **_base)) > 0
+                _sep_contours = find_lce_region_contours(lon_h, lat_h, ssh_h, **_base, min_lon=sep_min_lon) if sep_min_lon is not None else []
+                lce_sep_flag = len(_sep_contours) > 0
+                lce_det_flag = (
+                    len(find_lce_region_contours(lon_h, lat_h, ssh_h, **_base, min_lon=det_min_lon)) > 0
+                    if det_min_lon is not None else lce_timing_flag
+                )
+            except Exception:
+                lce_timing_flag = lce_sep_flag = lce_det_flag = False
+            return (lead, max_lat_model, max_lat_aviso, lce_timing_flag, lce_sep_flag, lce_det_flag)
         return (lead, max_lat_model, max_lat_aviso)
     except Exception:
         return None
@@ -1031,9 +1239,10 @@ def process_hycom_file_for_timing_only(
 def compute_divergence_from_series(
     series_model: List[Tuple[int, float]],
     series_aviso: List[Tuple[int, float]],
+    lead_has_lce_model: Optional[Dict[int, bool]] = None,
 ) -> Optional[int]:
     """From (lead, max_lat) series for model and AVISO, return model_first - aviso_first or None."""
-    first_model = first_detachment_day_from_max_lat_series(series_model)
+    first_model = first_detachment_day_from_max_lat_series(series_model, lead_has_lce=lead_has_lce_model)
     first_aviso = first_detachment_day_from_max_lat_series(series_aviso)
     if first_model is not None and first_aviso is not None:
         return first_model - first_aviso
@@ -1139,14 +1348,14 @@ def plot_timeseries_all_forecasts(
     valid_gliders = [r for r in results_gliders if r.get("success") and r.get("date")]
     has_forecast_start = valid_ref and valid_ref[0].get("forecast_start") is not None
     if has_forecast_start:
-        # Group by forecast_start, plot lead time vs MHD per forecast + mean
+        # Group by forecast_start, plot lead time vs MHD per forecast + mean ± std
+        soft_blue = "#6BAED6"
         ref_by_fs = defaultdict(list)
         for r in valid_ref:
             fs = r.get("forecast_start")
             if fs is not None:
                 ref_by_fs[fs].append(r)
         all_lead_ref = defaultdict(list)
-        soft_blue = "#6BAED6"
         for fs, group in sorted(ref_by_fs.items()):
             leads, mhds = [], []
             for r in group:
@@ -1160,11 +1369,16 @@ def plot_timeseries_all_forecasts(
                     all_lead_ref[lead].append(r["mhd"] * 111.0)
             if leads:
                 s = sorted(zip(leads, mhds))
-                ax.plot([x[0] for x in s], [x[1] for x in s], "-", linewidth=2, color=soft_blue, alpha=0.7)
+                ax.plot([x[0] for x in s], [x[1] for x in s], "-", linewidth=1, color=soft_blue, alpha=0.5)
         if all_lead_ref:
             lead_sorted = sorted(all_lead_ref.keys())
-            mean_mhd = [np.mean(all_lead_ref[lt]) for lt in lead_sorted]
-            ax.plot(lead_sorted, mean_mhd, "-", linewidth=3, color="black", label=f"Mean ({ref_label})", zorder=10)
+            mean_ref = [np.mean(all_lead_ref[lt]) for lt in lead_sorted]
+            std_ref  = [np.std(all_lead_ref[lt])  for lt in lead_sorted]
+            ax.plot(lead_sorted, mean_ref, "-", linewidth=2.5, color="steelblue", label=f"Mean ({ref_label})", zorder=5)
+            ax.fill_between(lead_sorted,
+                            [m - s for m, s in zip(mean_ref, std_ref)],
+                            [m + s for m, s in zip(mean_ref, std_ref)],
+                            color="steelblue", alpha=0.2)
         gliders_by_fs = defaultdict(list)
         for r in valid_gliders:
             fs = r.get("forecast_start")
@@ -1184,11 +1398,16 @@ def plot_timeseries_all_forecasts(
                     all_lead_gl[lead].append(r["mhd"] * 111.0)
             if leads:
                 s = sorted(zip(leads, mhds))
-                ax.plot([x[0] for x in s], [x[1] for x in s], "-", linewidth=2, color="salmon", alpha=0.7)
+                ax.plot([x[0] for x in s], [x[1] for x in s], "-", linewidth=1, color="salmon", alpha=0.5)
         if all_lead_gl:
             lead_sorted = sorted(all_lead_gl.keys())
-            mean_mhd = [np.mean(all_lead_gl[lt]) for lt in lead_sorted]
-            ax.plot(lead_sorted, mean_mhd, "-", linewidth=3, color="darkred", label=f"Mean ({gliders_label})", zorder=10)
+            mean_gl = [np.mean(all_lead_gl[lt]) for lt in lead_sorted]
+            std_gl  = [np.std(all_lead_gl[lt])  for lt in lead_sorted]
+            ax.plot(lead_sorted, mean_gl, "-", linewidth=2.5, color="darkred", label=f"Mean ({gliders_label})", zorder=5)
+            ax.fill_between(lead_sorted,
+                            [m - s for m, s in zip(mean_gl, std_gl)],
+                            [m + s for m, s in zip(mean_gl, std_gl)],
+                            color="salmon", alpha=0.2)
         ax.set_xlabel("Lead Time (days)", fontsize=11)
         ax.set_xlim(0, MAX_LEAD_DAYS)
     else:
@@ -1203,6 +1422,7 @@ def plot_timeseries_all_forecasts(
         ax.set_xlabel("Date", fontsize=11)
         plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha="right")
     ax.set_ylabel("Modified Hausdorff Distance (km)", fontsize=11)
+    ax.set_ylim(0, 350)
     ax.set_title("MHD time series (all forecasts)", fontsize=12, fontweight="bold")
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=9)
@@ -1281,12 +1501,78 @@ def plot_timeseries_by_date(
 
     ax.set_xlabel("Date", fontsize=11)
     ax.set_ylabel("Modified Hausdorff Distance (km)", fontsize=11)
+    ax.set_ylim(0, 350)
     ax.set_title("MHD vs actual date (mean ± std across forecasts)", fontsize=12, fontweight="bold")
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=9)
     plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha="right")
     plt.tight_layout()
     path = os.path.join(output_dir, f"mhd_timeseries_by_date{suffix}.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Wrote {path}")
+
+
+def plot_mean_std_by_date(
+    results_ref: List[Dict],
+    results_gliders: List[Dict],
+    output_dir: str,
+    ref_label: str = "REF",
+    gliders_label: str = "GLIDERS",
+    suffix: str = "",
+) -> None:
+    """MHD mean ± std vs actual date (no individual forecast lines)."""
+
+    def _collect(results):
+        by_date = defaultdict(list)
+        for r in results:
+            if not r.get("success") or not r.get("date") or not np.isfinite(r.get("mhd", np.nan)):
+                continue
+            if r.get("forecast_start") is None:
+                continue
+            date_obj = datetime.strptime(r["date"], "%Y%m%d")
+            by_date[date_obj].append(r["mhd"] * 111.0)
+        return by_date
+
+    ref_by_date = _collect(results_ref)
+    gl_by_date  = _collect(results_gliders)
+
+    if not ref_by_date and not gl_by_date:
+        return
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+
+    if ref_by_date:
+        dates_s  = sorted(ref_by_date.keys())
+        mean_ref = [np.mean(ref_by_date[d]) for d in dates_s]
+        std_ref  = [np.std(ref_by_date[d])  for d in dates_s]
+        ax.plot(dates_s, mean_ref, "-", linewidth=2.5, color="steelblue",
+                label=f"Mean ({ref_label})", zorder=5)
+        ax.fill_between(dates_s,
+                        [m - s for m, s in zip(mean_ref, std_ref)],
+                        [m + s for m, s in zip(mean_ref, std_ref)],
+                        color="steelblue", alpha=0.2)
+
+    if gl_by_date:
+        dates_s = sorted(gl_by_date.keys())
+        mean_gl = [np.mean(gl_by_date[d]) for d in dates_s]
+        std_gl  = [np.std(gl_by_date[d])  for d in dates_s]
+        ax.plot(dates_s, mean_gl, "-", linewidth=2.5, color="darkred",
+                label=f"Mean ({gliders_label})", zorder=5)
+        ax.fill_between(dates_s,
+                        [m - s for m, s in zip(mean_gl, std_gl)],
+                        [m + s for m, s in zip(mean_gl, std_gl)],
+                        color="salmon", alpha=0.2)
+
+    ax.set_xlabel("Date", fontsize=11)
+    ax.set_ylabel("Modified Hausdorff Distance (km)", fontsize=11)
+    ax.set_ylim(0, 350)
+    ax.set_title("MHD mean ± std vs actual date", fontsize=12, fontweight="bold")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=9)
+    plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha="right")
+    plt.tight_layout()
+    path = os.path.join(output_dir, f"mhd_mean_std_by_date{suffix}.png")
     plt.savefig(path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"Wrote {path}")
@@ -1330,45 +1616,45 @@ def plot_mean_std_from_results(
             gliders_data[lead].append(r["mhd"] * 111.0)
     has_ref = bool(ref_data)
     has_gliders = bool(gliders_data)
-    # REF only (same as pycodes plot_mean_std)
+    # REF only
     if ref_data:
         lead_sorted = sorted(ref_data.keys())
         mean_ref = [np.mean(ref_data[lt]) for lt in lead_sorted]
         std_ref = [np.std(ref_data[lt]) for lt in lead_sorted]
         fig, ax = plt.subplots(figsize=(10, 6))
-        ax.plot(lead_sorted, mean_ref, "-", color="#1f77b4", linewidth=2.5)
-        ax.fill_between(lead_sorted, np.array(mean_ref) - np.array(std_ref), np.array(mean_ref) + np.array(std_ref), color="#1f77b4", alpha=0.18)
+        ax.plot(lead_sorted, mean_ref, "-", color="steelblue", linewidth=2.5)
+        ax.fill_between(lead_sorted, np.array(mean_ref) - np.array(std_ref), np.array(mean_ref) + np.array(std_ref), color="steelblue", alpha=0.2)
         ax.set_xlabel("Lead Time (days)", fontsize=12)
         ax.set_xlim(0, MAX_LEAD_DAYS)
         ax.set_ylabel("Modified Hausdorff Distance (km)", fontsize=12)
         ax.set_title(f"MHD: AVISO vs {ref_label} (mean ± std)", fontsize=14, fontweight="bold")
-        ax.set_ylim(0, 140)
+        ax.set_ylim(0, 200)
         ax.grid(True, alpha=0.3)
         plt.tight_layout()
         path = os.path.join(output_dir, f"plot_mhd_timeseries_mean_std_ref{suffix}.png")
         plt.savefig(path, dpi=150, bbox_inches="tight")
         plt.close()
         print(f"Wrote {path}")
-    # GLIDERS only (same as pycodes)
+    # GLIDERS only
     if gliders_data:
         lead_sorted = sorted(gliders_data.keys())
         mean_gl = [np.mean(gliders_data[lt]) for lt in lead_sorted]
         std_gl = [np.std(gliders_data[lt]) for lt in lead_sorted]
         fig, ax = plt.subplots(figsize=(10, 6))
-        ax.plot(lead_sorted, mean_gl, "-", color="r", linewidth=2.5)
-        ax.fill_between(lead_sorted, np.array(mean_gl) - np.array(std_gl), np.array(mean_gl) + np.array(std_gl), color="r", alpha=0.18)
+        ax.plot(lead_sorted, mean_gl, "-", color="darkred", linewidth=2.5)
+        ax.fill_between(lead_sorted, np.array(mean_gl) - np.array(std_gl), np.array(mean_gl) + np.array(std_gl), color="salmon", alpha=0.2)
         ax.set_xlabel("Lead Time (days)", fontsize=12)
         ax.set_xlim(0, MAX_LEAD_DAYS)
         ax.set_ylabel("Modified Hausdorff Distance (km)", fontsize=12)
         ax.set_title(f"MHD: AVISO vs {gliders_label} (mean ± std)", fontsize=14, fontweight="bold")
-        ax.set_ylim(0, 140)
+        ax.set_ylim(0, 200)
         ax.grid(True, alpha=0.3)
         plt.tight_layout()
         path = os.path.join(output_dir, f"plot_mhd_timeseries_mean_std_gliders{suffix}.png")
         plt.savefig(path, dpi=150, bbox_inches="tight")
         plt.close()
         print(f"Wrote {path}")
-    # Both on one figure (same as pycodes plot_mean_std_both)
+    # Both on one figure
     if has_ref and has_gliders:
         lead_sorted_ref = sorted(ref_data.keys())
         mean_ref = [np.mean(ref_data[lt]) for lt in lead_sorted_ref]
@@ -1377,16 +1663,16 @@ def plot_mean_std_from_results(
         mean_gl = [np.mean(gliders_data[lt]) for lt in lead_sorted_gl]
         std_gl = [np.std(gliders_data[lt]) for lt in lead_sorted_gl]
         fig, ax = plt.subplots(figsize=(10, 6))
-        ax.fill_between(lead_sorted_ref, np.array(mean_ref) - np.array(std_ref), np.array(mean_ref) + np.array(std_ref), color="#1f77b4", alpha=0.18)
-        ax.plot(lead_sorted_ref, mean_ref, "-", color="#1f77b4", linewidth=2.5, label=ref_label)
-        ax.fill_between(lead_sorted_gl, np.array(mean_gl) - np.array(std_gl), np.array(mean_gl) + np.array(std_gl), color="r", alpha=0.18)
-        ax.plot(lead_sorted_gl, mean_gl, "-", color="r", linewidth=2.5, label=gliders_label)
+        ax.fill_between(lead_sorted_ref, np.array(mean_ref) - np.array(std_ref), np.array(mean_ref) + np.array(std_ref), color="steelblue", alpha=0.2)
+        ax.plot(lead_sorted_ref, mean_ref, "-", color="steelblue", linewidth=2.5, label=ref_label)
+        ax.fill_between(lead_sorted_gl, np.array(mean_gl) - np.array(std_gl), np.array(mean_gl) + np.array(std_gl), color="salmon", alpha=0.2)
+        ax.plot(lead_sorted_gl, mean_gl, "-", color="darkred", linewidth=2.5, label=gliders_label)
         ax.legend()
         ax.set_xlabel("Lead Time (days)", fontsize=12)
         ax.set_xlim(0, MAX_LEAD_DAYS)
         ax.set_ylabel("Modified Hausdorff Distance (km)", fontsize=12)
         ax.set_title(f"MHD: AVISO vs {ref_label} and {gliders_label} (mean ± std)", fontsize=14, fontweight="bold")
-        ax.set_ylim(0, 140)
+        ax.set_ylim(0, 200)
         ax.grid(True, alpha=0.3)
         plt.tight_layout()
         path = os.path.join(output_dir, f"plot_mhd_timeseries_mean_std_both{suffix}.png")
@@ -1396,33 +1682,48 @@ def plot_mean_std_from_results(
 
 
 def _plot_one_timing_histogram(
-    divergences: List[int],
+    items: List[Tuple[int, datetime]],
     output_dir: str,
     title: str,
     xlabel: str,
     filename: str,
     color: str = "#1f77b4",
 ) -> None:
-    """One histogram (REF or GLIDERS), same bins as pycodes. Saves to output_dir/filename."""
-    if not divergences:
+    """One histogram (REF or GLIDERS). items is list of (divergence_days, forecast_start_date).
+    Forecast dates are annotated inside bars."""
+    if not items:
         return
-    fig, ax = plt.subplots(figsize=(10, 6))
-    low = min(-60, int(np.floor(min(divergences))) - 1)
-    high = max(31, int(np.ceil(max(divergences))) + 1)
-    bin_edges = [low, -25, -15, -5, 5, 15, 25, high]
-    counts, _, _ = ax.hist(divergences, bins=bin_edges, density=False, color=color, alpha=0.8, edgecolor="black")
-    n = len(divergences)
-    pcts = 100.0 * np.array(counts) / n
+    divergences = [d for d, _ in items]
+    bin_edges = [-float("inf"), -25, -15, -5, 5, 15, 25, float("inf")]
     bin_centers = [-30, -20, -10, 0, 10, 20, 30]
     bin_labels = ["-25+", "-25 to -15", "-15 to -5", "-5 to 5", "5 to 15", "15 to 25", "25+"]
     widths = [10, 9, 9, 10, 9, 9, 10]
-    ax.clear()
-    for i, (cen, pct) in enumerate(zip(bin_centers, pcts)):
-        ax.bar(cen, pct, width=widths[i], color=color, alpha=0.8, edgecolor="black")
+    n = len(items)
+
+    bins: List[List[datetime]] = [[] for _ in bin_centers]
+    for div, fs_dt in items:
+        for i in range(len(bin_edges) - 1):
+            if bin_edges[i] <= div < bin_edges[i + 1]:
+                bins[i].append(fs_dt)
+                break
+    pcts = [100.0 * len(b) / n for b in bins]
+
+    counts = [len(b) for b in bins]
+    fig, ax = plt.subplots(figsize=(12, 7))
+    for i, (cen, w, cnt) in enumerate(zip(bin_centers, widths, counts)):
+        ax.bar(cen, cnt, width=w, color=color, alpha=0.8, edgecolor="black")
+        if bins[i] and cnt > 0:
+            for j, fs_dt in enumerate(bins[i]):
+                ax.text(cen, j + 0.5, fs_dt.strftime("%Y-%m-%d"),
+                        ha="center", va="center", fontsize=7, fontweight="bold", color="black", clip_on=True)
     ax.set_xticks(bin_centers)
     ax.set_xticklabels(bin_labels)
     ax.set_xlabel(xlabel, fontsize=12)
-    ax.set_ylabel("% of occurrence", fontsize=12)
+    ax.set_ylabel("Number of forecasts", fontsize=12)
+    ax.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+    ax2 = ax.twinx()
+    ax2.set_ylim(0, ax.get_ylim()[1] / n * 100)
+    ax2.set_ylabel("% of occurrence", fontsize=12)
     ax.set_title(title, fontsize=14, fontweight="bold")
     ax.axvline(0, color="gray", linestyle="--", linewidth=1)
     ax.grid(True, alpha=0.3)
@@ -1435,35 +1736,351 @@ def _plot_one_timing_histogram(
 
 
 def plot_timing_distribution(
-    divergences_ref: List[int],
-    divergences_gliders: List[int],
+    timing_ref: List,
+    timing_gliders: List,
     output_dir: str,
     ref_label: str = "HYCOM_REF",
     gliders_label: str = "HYCOM_GLIDERS",
 ) -> None:
-    """Two histograms like pycodes: one for REF (blue), one for GLIDERS (red)."""
-    if divergences_ref:
-        _plot_one_timing_histogram(
-            divergences_ref,
-            output_dir,
-            title=f"Distribution of first LCE detachment timing: {ref_label} vs AVISO (all REF forecasts)",
-            xlabel=f"Divergence (days): {ref_label} first LCE day − AVISO first LCE day",
-            filename="histogram_first_lce_divergence_aviso_hycom_ref.png",
-            color="#1f77b4",
-        )
-    else:
-        print("No REF divergence values for timing distribution. Skip REF histogram.")
-    if divergences_gliders:
-        _plot_one_timing_histogram(
-            divergences_gliders,
-            output_dir,
-            title=f"Distribution of first LCE detachment timing: {gliders_label} vs AVISO (all GLIDERS forecasts)",
-            xlabel=f"Divergence (days): {gliders_label} first LCE day − AVISO first LCE day",
-            filename="histogram_first_lce_divergence_aviso_hycom_gliders.png",
-            color="r",
-        )
-    else:
-        print("No GLIDERS divergence values for timing distribution. Skip GLIDERS histogram.")
+    """Grouped-bar histogram: REF and GLIDERS side by side per bin. Each entry is (forecast_start, divergence_days)."""
+    if not timing_ref and not timing_gliders:
+        print("No divergence values for timing distribution.")
+        return
+    bin_edges = [-float("inf"), -25, -15, -5, 5, 15, 25, float("inf")]
+    bin_centers = [-30, -20, -10, 0, 10, 20, 30]
+    bin_labels = ["-25+", "-25 to -15", "-15 to -5", "-5 to 5", "5 to 15", "15 to 25", "25+"]
+    widths = [10, 9, 9, 10, 9, 9, 10]
+
+    def _bin(timing):
+        b = [[] for _ in bin_centers]
+        for entry in timing:
+            fs, div = entry[0], entry[1]
+            aviso_offset = entry[2] if len(entry) > 2 else None
+            for i in range(len(bin_edges) - 1):
+                if bin_edges[i] <= div < bin_edges[i + 1]:
+                    b[i].append((fs, div, aviso_offset))
+                    break
+        return b
+
+    bins_ref = _bin(timing_ref)
+    bins_gl  = _bin(timing_gliders)
+    n_ref = len(timing_ref)
+    n_gl  = len(timing_gliders)
+    n_total = max(n_ref, n_gl, 1)
+
+    fig, ax = plt.subplots(figsize=(14, 7))
+    for i, (cen, w) in enumerate(zip(bin_centers, widths)):
+        hw = w / 2 * 0.7
+        # REF bar (left), GLIDERS bar (right) — touching at bin center
+        cnt_r = len(bins_ref[i])
+        ax.bar(cen - hw / 2, cnt_r, width=hw, color="steelblue", alpha=0.8, edgecolor="black",
+               label=ref_label if i == 0 else None)
+        for j, (fs_dt, div, aviso_offset) in enumerate(bins_ref[i]):
+            if aviso_offset is not None:
+                label = f"{aviso_offset}d"  # line 2: f"\n{div:+d}d"
+                print(f"[TimingDist REF] forecast={fs_dt.strftime('%Y-%m-%d')} aviso_lead={aviso_offset}d div={div:+d}d")
+            else:
+                label = fs_dt.strftime('%-m/%-d/%y')  # line 2: f"\n{div:+d}d"
+            ax.text(cen - hw / 2, j + 0.5, label,
+                    ha="center", va="center", fontsize=6, fontweight="bold", color="white",
+                    rotation=0, clip_on=True, linespacing=1.2)
+        cnt_g = len(bins_gl[i])
+        ax.bar(cen + hw / 2, cnt_g, width=hw, color="darkred", alpha=0.8, edgecolor="black",
+               label=gliders_label if i == 0 else None)
+        for j, (fs_dt, div, aviso_offset) in enumerate(bins_gl[i]):
+            if aviso_offset is not None:
+                label = f"{aviso_offset}d"  # line 2: f"\n{div:+d}d"
+                print(f"[TimingDist GLIDERS] forecast={fs_dt.strftime('%Y-%m-%d')} aviso_lead={aviso_offset}d div={div:+d}d")
+            else:
+                label = fs_dt.strftime('%-m/%-d/%y')  # line 2: f"\n{div:+d}d"
+            ax.text(cen + hw / 2, j + 0.5, label,
+                    ha="center", va="center", fontsize=6, fontweight="bold", color="white",
+                    rotation=0, clip_on=True, linespacing=1.2)
+    ax.set_xticks(bin_centers)
+    ax.set_xticklabels(bin_labels)
+    ax.set_xlabel("Divergence (days): model first LCE day − AVISO first LCE day\n← earlier than AVISO                                                    later than AVISO →", fontsize=12)
+    ax.set_ylabel("Number of forecasts", fontsize=12)
+    ax.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+    ax2 = ax.twinx()
+    ax2.set_ylim(0, ax.get_ylim()[1] / n_total * 100)
+    ax2.set_ylabel("% of occurrence", fontsize=12)
+    ax.set_title("Distribution of first LCE detachment timing vs AVISO", fontsize=14, fontweight="bold", pad=28)
+    ax.text(0.5, 1.02, "Bar label: days from forecast start to AVISO first detachment",
+            transform=ax.transAxes, ha="center", va="bottom", fontsize=11, fontstyle="italic")
+    ax.axvline(0, color="gray", linestyle="--", linewidth=1)
+    ax.grid(True, alpha=0.3)
+    mean_lines = []
+    if timing_ref:
+        divs = [e[1] for e in timing_ref]
+        mean_lines.append(f"{ref_label}: mean = {np.mean(divs):.1f} d, std = {np.std(divs):.1f} d (n={n_ref})")
+    if timing_gliders:
+        divs = [e[1] for e in timing_gliders]
+        mean_lines.append(f"{gliders_label}: mean = {np.mean(divs):.1f} d, std = {np.std(divs):.1f} d (n={n_gl})")
+    if mean_lines:
+        ax.text(0.02, 0.97, "\n".join(mean_lines), transform=ax.transAxes,
+                fontsize=9, va="top", ha="left",
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.7))
+    ax.legend(fontsize=10)
+    plt.tight_layout()
+    path = os.path.join(output_dir, "histogram_first_lce_divergence_aviso.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Wrote {path}")
+    if timing_ref:
+        divs = [e[1] for e in timing_ref]
+        print(f"  {ref_label}: n={n_ref}, mean={np.mean(divs):.2f} days, std={np.std(divs):.2f} days")
+    if timing_gliders:
+        divs = [e[1] for e in timing_gliders]
+        print(f"  {gliders_label}: n={n_gl}, mean={np.mean(divs):.2f} days, std={np.std(divs):.2f} days")
+
+
+def _plot_separation_histogram(
+    confirmed: List[Tuple[int, datetime]],
+    uncertain: List[Tuple[int, datetime]],
+    output_dir: str,
+    title: str,
+    xlabel: str,
+    filename: str,
+    color: str,
+) -> None:
+    """Histogram of separation timing with confirmed (solid) and uncertain (hatched) bars stacked.
+    Each entry is (divergence_days, forecast_start_date). Forecast dates are annotated inside bars."""
+    all_items = confirmed + uncertain
+    if not all_items:
+        return
+    bin_edges = [-float("inf"), -25, -15, -5, 5, 15, 25, float("inf")]
+    bin_centers = [-30, -20, -10, 0, 10, 20, 30]
+    bin_labels = ["-25+", "-25 to -15", "-15 to -5", "-5 to 5", "5 to 15", "15 to 25", "25+"]
+    widths = [10, 9, 9, 10, 9, 9, 10]
+    n_total = len(all_items)
+
+    def _bin_items(items):
+        bins = [[] for _ in bin_centers]
+        for div, fs_dt in items:
+            for i in range(len(bin_edges) - 1):
+                if bin_edges[i] <= div < bin_edges[i + 1]:
+                    bins[i].append(fs_dt)
+                    break
+        return bins
+
+    conf_bins = _bin_items(confirmed)
+    unc_bins  = _bin_items(uncertain)
+    counts_confirmed = [len(b) for b in conf_bins]
+    counts_uncertain = [len(b) for b in unc_bins]
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+    for i, (cen, w) in enumerate(zip(bin_centers, widths)):
+        ax.bar(cen, counts_confirmed[i], width=w, color=color, alpha=0.8, edgecolor="black")
+        ax.bar(cen, counts_uncertain[i], width=w, bottom=counts_confirmed[i],
+               color=color, alpha=0.4, edgecolor="black", hatch="//",
+               label="uncertain" if i == 0 else None)
+        all_dates = [(d, True) for d in conf_bins[i]] + [(d, False) for d in unc_bins[i]]
+        total_bar_cnt = counts_confirmed[i] + counts_uncertain[i]
+        if all_dates and total_bar_cnt > 0:
+            for j, (fs_dt, _is_conf) in enumerate(all_dates):
+                ax.text(
+                    cen, j + 0.5,
+                    fs_dt.strftime("%Y-%m-%d"),
+                    ha="center", va="center",
+                    fontsize=7, fontweight="bold", color="black",
+                    clip_on=True,
+                )
+    ax.set_xticks(bin_centers)
+    ax.set_xticklabels(bin_labels)
+    ax.set_xlabel(xlabel, fontsize=12)
+    ax.set_ylabel("Number of forecasts", fontsize=12)
+    ax.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+    ax2 = ax.twinx()
+    ax2.set_ylim(0, ax.get_ylim()[1] / n_total * 100)
+    ax2.set_ylabel("% of occurrence", fontsize=12)
+    ax.set_title(title, fontsize=14, fontweight="bold")
+    ax.axvline(0, color="gray", linestyle="--", linewidth=1)
+    ax.grid(True, alpha=0.3)
+    if uncertain:
+        ax.legend(fontsize=9)
+    plt.tight_layout()
+    path = os.path.join(output_dir, filename)
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Wrote {path}")
+    confirmed_divs = [d for d, _ in confirmed]
+    uncertain_divs = [d for d, _ in uncertain]
+    all_divs = confirmed_divs + uncertain_divs
+    print(f"  Total: {n_total} ({len(confirmed)} confirmed, {len(uncertain)} uncertain), mean: {np.mean(all_divs):.2f} days, std: {np.std(all_divs):.2f} days")
+
+
+def plot_separation_timing(
+    confirmed_ref: List[Tuple[int, datetime]],
+    uncertain_ref: List[Tuple[int, datetime]],
+    confirmed_gliders: List[Tuple[int, datetime]],
+    uncertain_gliders: List[Tuple[int, datetime]],
+    output_dir: str,
+    ref_label: str = "REF",
+    gliders_label: str = "GLIDERS",
+    aviso_sep_date: Optional[datetime] = None,
+) -> None:
+    """Grouped-bar histogram of final LC separation timing: REF and GLIDERS side by side per bin."""
+    all_ref = confirmed_ref + uncertain_ref
+    all_gl  = confirmed_gliders + uncertain_gliders
+    if not all_ref and not all_gl:
+        print("No separation timing values.")
+        return
+    aviso_str = f" (AVISO: {aviso_sep_date.strftime('%Y-%m-%d')})" if aviso_sep_date else ""
+    bin_edges = [-float("inf"), -25, -15, -5, 5, 15, 25, float("inf")]
+    bin_centers = [-30, -20, -10, 0, 10, 20, 30]
+    bin_labels = ["-25+", "-25 to -15", "-15 to -5", "-5 to 5", "5 to 15", "15 to 25", "25+"]
+    widths = [10, 9, 9, 10, 9, 9, 10]
+    n_total = max(len(all_ref), len(all_gl), 1)
+
+    def _bin_sep(confirmed, uncertain):
+        conf_b = [[] for _ in bin_centers]
+        unc_b  = [[] for _ in bin_centers]
+        for items, dest in [(confirmed, conf_b), (uncertain, unc_b)]:
+            for div, fs_dt in items:
+                for i in range(len(bin_edges) - 1):
+                    if bin_edges[i] <= div < bin_edges[i + 1]:
+                        dest[i].append((fs_dt, div))
+                        break
+        return conf_b, unc_b
+
+    conf_r, unc_r = _bin_sep(confirmed_ref, uncertain_ref)
+    conf_g, unc_g = _bin_sep(confirmed_gliders, uncertain_gliders)
+
+    fig, ax = plt.subplots(figsize=(14, 7))
+    for i, (cen, w) in enumerate(zip(bin_centers, widths)):
+        hw = w / 2 * 0.7
+        # REF bar (left), GLIDERS bar (right) — touching at bin center
+        cnt_rc = len(conf_r[i]); cnt_ru = len(unc_r[i])
+        ax.bar(cen - hw / 2, cnt_rc, width=hw, color="steelblue", alpha=0.8, edgecolor="black",
+               label=f"{ref_label} confirmed" if i == 0 else None)
+        ax.bar(cen - hw / 2, cnt_ru, width=hw, bottom=cnt_rc, color="steelblue", alpha=0.4,
+               edgecolor="black", hatch="//", label=f"{ref_label} uncertain" if i == 0 else None)
+        for j, (fs_dt, div) in enumerate(conf_r[i] + unc_r[i]):
+            if aviso_sep_date is not None:
+                offset_days = (aviso_sep_date - fs_dt).days
+                offset_str = f"{offset_days}d"  # line 2: f"\n{div:+d}d"
+                print(f"[SepTiming REF] forecast={fs_dt.strftime('%Y-%m-%d')} aviso_sep={aviso_sep_date.strftime('%Y-%m-%d')} offset={offset_days}d div={div:+d}d")
+            else:
+                offset_str = fs_dt.strftime('%-m/%-d/%y')  # line 2: f"\n{div:+d}d"
+            ax.text(cen - hw / 2, j + 0.5, offset_str,
+                    ha="center", va="center", fontsize=6, fontweight="bold", color="white",
+                    rotation=0, clip_on=True, linespacing=1.2)
+        cnt_gc = len(conf_g[i]); cnt_gu = len(unc_g[i])
+        ax.bar(cen + hw / 2, cnt_gc, width=hw, color="darkred", alpha=0.8, edgecolor="black",
+               label=f"{gliders_label} confirmed" if i == 0 else None)
+        ax.bar(cen + hw / 2, cnt_gu, width=hw, bottom=cnt_gc, color="darkred", alpha=0.4,
+               edgecolor="black", hatch="//", label=f"{gliders_label} uncertain" if i == 0 else None)
+        for j, (fs_dt, div) in enumerate(conf_g[i] + unc_g[i]):
+            if aviso_sep_date is not None:
+                offset_days = (aviso_sep_date - fs_dt).days
+                offset_str = f"{offset_days}d"  # line 2: f"\n{div:+d}d"
+                print(f"[SepTiming GLIDERS] forecast={fs_dt.strftime('%Y-%m-%d')} aviso_sep={aviso_sep_date.strftime('%Y-%m-%d')} offset={offset_days}d div={div:+d}d")
+            else:
+                offset_str = fs_dt.strftime('%-m/%-d/%y')  # line 2: f"\n{div:+d}d"
+            ax.text(cen + hw / 2, j + 0.5, offset_str,
+                    ha="center", va="center", fontsize=6, fontweight="bold", color="white",
+                    rotation=0, clip_on=True, linespacing=1.2)
+    ax.set_xticks(bin_centers)
+    ax.set_xticklabels(bin_labels)
+    ax.set_xlabel("Days: model final separation − AVISO final separation\n← earlier than AVISO                                                    later than AVISO →", fontsize=12)
+    ax.set_ylabel("Number of forecasts", fontsize=12)
+    ax.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+    ax2 = ax.twinx()
+    ax2.set_ylim(0, ax.get_ylim()[1] / n_total * 100)
+    ax2.set_ylabel("% of occurrence", fontsize=12)
+    ax.set_title(f"Final LC separation timing vs AVISO{aviso_str}", fontsize=14, fontweight="bold", pad=28)
+    ax.text(0.5, 1.02, "Bar label: days from forecast start to AVISO final separation",
+            transform=ax.transAxes, ha="center", va="bottom", fontsize=11, fontstyle="italic")
+    ax.axvline(0, color="gray", linestyle="--", linewidth=1)
+    ax.grid(True, alpha=0.3)
+    # Mean annotations
+    mean_lines = []
+    if all_ref:
+        divs_r = [d for d, _ in all_ref]
+        mean_lines.append(f"{ref_label}: mean = {np.mean(divs_r):.1f} d, std = {np.std(divs_r):.1f} d (n={len(divs_r)})")
+    if all_gl:
+        divs_g = [d for d, _ in all_gl]
+        mean_lines.append(f"{gliders_label}: mean = {np.mean(divs_g):.1f} d, std = {np.std(divs_g):.1f} d (n={len(divs_g)})")
+    if mean_lines:
+        ax.text(0.02, 0.97, "\n".join(mean_lines), transform=ax.transAxes,
+                fontsize=9, va="top", ha="left",
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.7))
+    ax.legend(fontsize=9)
+    plt.tight_layout()
+    path = os.path.join(output_dir, "histogram_final_separation_timing.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Wrote {path}")
+    for label, items in [(ref_label, all_ref), (gliders_label, all_gl)]:
+        if items:
+            divs = [d for d, _ in items]
+            print(f"  {label}: n={len(items)}, mean={np.mean(divs):.2f} days, std={np.std(divs):.2f} days")
+
+
+def plot_detachment_counts(
+    counts_ref: List[Tuple[datetime, int, int]],
+    counts_gliders: List[Tuple[datetime, int, int]],
+    output_dir: str,
+    ref_label: str = "REF",
+    gliders_label: str = "GLIDERS",
+    aviso_total: Optional[int] = None,
+) -> None:
+    """
+    Grouped bar chart: detachment count per forecast start date.
+    counts_ref / counts_gliders: list of (forecast_start, model_count, aviso_count).
+    aviso_total: total AVISO detachments over the full time series (shown in legend label).
+    """
+    if not counts_ref and not counts_gliders:
+        print("No detachment count data. Skip plot.")
+        return
+
+    all_dates = sorted(set(fs for fs, _, _ in counts_ref) | set(fs for fs, _, _ in counts_gliders))
+    x = np.arange(len(all_dates))
+    date_labels = [d.strftime("%Y-%m-%d") for d in all_dates]
+
+    ref_map  = {fs: (m, a) for fs, m, a in counts_ref}
+    gl_map   = {fs: (m, a) for fs, m, a in counts_gliders}
+
+    ref_model = [ref_map.get(d, (0, 0))[0] for d in all_dates]
+    ref_aviso = [ref_map.get(d, (0, 0))[1] for d in all_dates]
+    gl_model  = [gl_map.get(d, (0, 0))[0]  for d in all_dates]
+    gl_aviso  = [gl_map.get(d, (0, 0))[1]  for d in all_dates]
+
+    has_ref     = bool(counts_ref)
+    has_gliders = bool(counts_gliders)
+    n_groups    = sum([has_ref, has_gliders, 1])  # +1 for AVISO
+    width       = 0.2
+
+    fig, ax = plt.subplots(figsize=(max(10, len(all_dates) * 0.6 + 2), 5))
+
+    slot = 0
+    if has_ref:
+        off = (slot - (n_groups - 1) / 2) * width
+        ax.bar(x + off, ref_model, width, label=ref_label, color="steelblue")
+        slot += 1
+    if has_gliders:
+        off = (slot - (n_groups - 1) / 2) * width
+        ax.bar(x + off, gl_model, width, label=gliders_label, color="darkred")
+        slot += 1
+    # AVISO — use REF aviso if available, else GLIDERS
+    aviso_vals = ref_aviso if has_ref else gl_aviso
+    aviso_label = f"AVISO (total={aviso_total})" if aviso_total is not None else "AVISO"
+    off = (slot - (n_groups - 1) / 2) * width
+    ax.bar(x + off, aviso_vals, width, label=aviso_label, color="gray")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(date_labels, rotation=45, ha="right")
+    ax.set_xlabel("Forecast start date", fontsize=11)
+    ax.set_ylabel("Number of detachments", fontsize=11)
+    ax.set_title("LCE detachment count per forecast", fontsize=12, fontweight="bold")
+    ax.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+    ax.legend(fontsize=9)
+    ax.grid(True, axis="y", alpha=0.3)
+    plt.tight_layout()
+    path = os.path.join(output_dir, "detachment_count_per_forecast.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Wrote {path}")
 
 
 def _sanitize_label_for_filename(label: str) -> str:
@@ -1831,12 +2448,12 @@ def save_mhd_to_netcdf(
 
 
 def save_lce_timing_to_netcdf(
-    timing_ref: List[Tuple[datetime, int]],
-    timing_gliders: List[Tuple[datetime, int]],
+    timing_ref: List,
+    timing_gliders: List,
     output_dir: str,
     filename: str = "lce_timing_OSEs.nc",
 ) -> None:
-    """Save first-LCE timing (forecast_start, divergence_days) to NetCDF. Data same as timing histograms."""
+    """Save first-LCE timing (forecast_start, divergence_days[, aviso_offset_days]) to NetCDF."""
     if nc is None:
         return
     path = os.path.join(output_dir, filename)
@@ -1846,6 +2463,7 @@ def save_lce_timing_to_netcdf(
         return
     if not timing_ref and not timing_gliders:
         return
+    _FILL_INT = -9999
     with nc.Dataset(path, "w", format="NETCDF4") as ds:
         ds.setncattr("title", "LCE timing: forecast_start (YYYY-MM-DD), divergence_days (model first LCE day − AVISO first LCE day)")
         ds.createDimension("forecast_strlen", 10)
@@ -1857,35 +2475,49 @@ def save_lce_timing_to_netcdf(
             fs_ref.long_name = "forecast start REF (YYYY-MM-DD)"
             div_ref = ds.createVariable("ref_divergence_days", "i4", "n_ref")
             div_ref.long_name = "divergence (days): REF first LCE day − AVISO first LCE day"
-            for i, (fs_dt, d) in enumerate(timing_ref):
+            aviso_off_ref = ds.createVariable("ref_aviso_offset_days", "i4", "n_ref")
+            aviso_off_ref.long_name = "AVISO first LCE lead day within this forecast window"
+            aviso_off_ref.missing_value = _FILL_INT
+            for i, entry in enumerate(timing_ref):
+                fs_dt, d = entry[0], entry[1]
+                aviso_off = entry[2] if len(entry) > 2 else None
                 fs_ref[i, :] = list(fs_dt.strftime("%Y-%m-%d").ljust(10)[:10])
                 div_ref[i] = int(d)
+                aviso_off_ref[i] = int(aviso_off) if aviso_off is not None else _FILL_INT
         if n_gl > 0:
             ds.createDimension("n_gliders", n_gl)
             fs_gl = ds.createVariable("gliders_forecast_start", "S1", ("n_gliders", "forecast_strlen"))
             fs_gl.long_name = "forecast start GLIDERS (YYYY-MM-DD)"
             div_gl = ds.createVariable("gliders_divergence_days", "i4", "n_gliders")
             div_gl.long_name = "divergence (days): GLIDERS first LCE day − AVISO first LCE day"
-            for i, (fs_dt, d) in enumerate(timing_gliders):
+            aviso_off_gl = ds.createVariable("gliders_aviso_offset_days", "i4", "n_gliders")
+            aviso_off_gl.long_name = "AVISO first LCE lead day within this forecast window"
+            aviso_off_gl.missing_value = _FILL_INT
+            for i, entry in enumerate(timing_gliders):
+                fs_dt, d = entry[0], entry[1]
+                aviso_off = entry[2] if len(entry) > 2 else None
                 fs_gl[i, :] = list(fs_dt.strftime("%Y-%m-%d").ljust(10)[:10])
                 div_gl[i] = int(d)
+                aviso_off_gl[i] = int(aviso_off) if aviso_off is not None else _FILL_INT
     print(f"Wrote {path} (REF: {n_ref}, GLIDERS: {n_gl} timing values)")
 
 
 def load_lce_timing_from_netcdf(
     path: str,
-) -> Tuple[List[Tuple[datetime, int]], List[Tuple[datetime, int]]]:
-    """Load (forecast_start, divergence_days) for REF and GLIDERS from lce_timing_OSEs.nc."""
-    timing_ref: List[Tuple[datetime, int]] = []
-    timing_gliders: List[Tuple[datetime, int]] = []
+) -> Tuple[List, List, None]:
+    """Load (forecast_start, divergence_days, aviso_offset_days) 3-tuples for REF and GLIDERS."""
+    timing_ref: List = []
+    timing_gliders: List = []
+    _FILL_INT = -9999
     if nc is None or not os.path.isfile(path):
-        return timing_ref, timing_gliders
+        return timing_ref, timing_gliders, None
     try:
         with nc.Dataset(path, "r") as ds:
             if "n_ref" in ds.dimensions and "ref_forecast_start" in ds.variables and "ref_divergence_days" in ds.variables:
                 n_ref = len(ds.dimensions["n_ref"])
                 fs_ref = ds.variables["ref_forecast_start"]
                 div_ref = ds.variables["ref_divergence_days"][:]
+                aviso_off_ref = ds.variables["ref_aviso_offset_days"][:] if "ref_aviso_offset_days" in ds.variables else None
                 for i in range(n_ref):
                     fs_str = (
                         fs_ref[i, :].tobytes().decode("ascii", errors="ignore")
@@ -1898,11 +2530,13 @@ def load_lce_timing_from_netcdf(
                         fs_dt = datetime.strptime(fs_str[:10], "%Y-%m-%d")
                     except ValueError:
                         continue
-                    timing_ref.append((fs_dt, int(div_ref[i])))
+                    aviso_off = int(aviso_off_ref[i]) if aviso_off_ref is not None and int(aviso_off_ref[i]) != _FILL_INT else None
+                    timing_ref.append((fs_dt, int(div_ref[i]), aviso_off))
             if "n_gliders" in ds.dimensions and "gliders_forecast_start" in ds.variables and "gliders_divergence_days" in ds.variables:
                 n_gl = len(ds.dimensions["n_gliders"])
                 fs_gl = ds.variables["gliders_forecast_start"]
                 div_gl = ds.variables["gliders_divergence_days"][:]
+                aviso_off_gl = ds.variables["gliders_aviso_offset_days"][:] if "gliders_aviso_offset_days" in ds.variables else None
                 for i in range(n_gl):
                     fs_str = (
                         fs_gl[i, :].tobytes().decode("ascii", errors="ignore")
@@ -1915,11 +2549,272 @@ def load_lce_timing_from_netcdf(
                         fs_dt = datetime.strptime(fs_str[:10], "%Y-%m-%d")
                     except ValueError:
                         continue
-                    timing_gliders.append((fs_dt, int(div_gl[i])))
+                    aviso_off = int(aviso_off_gl[i]) if aviso_off_gl is not None and int(aviso_off_gl[i]) != _FILL_INT else None
+                    timing_gliders.append((fs_dt, int(div_gl[i]), aviso_off))
     except Exception as e:
         print(f"Warning: could not load timing from {path}: {e}")
-        return [], []
-    return timing_ref, timing_gliders
+        return [], [], None
+    return timing_ref, timing_gliders, None
+
+
+def save_separation_timing_to_netcdf(
+    aviso_sep_date: datetime,
+    confirmed_ref: List[Tuple[int, datetime]],
+    uncertain_ref: List[Tuple[int, datetime]],
+    confirmed_gliders: List[Tuple[int, datetime]],
+    uncertain_gliders: List[Tuple[int, datetime]],
+    output_dir: str,
+    filename: str = "lce_timing_OSEs.nc",
+) -> None:
+    """Append final LC separation timing to lce_timing_OSEs.nc (creates file if absent)."""
+    if nc is None:
+        return
+    path = os.path.join(output_dir, filename)
+    mode = "a" if os.path.isfile(path) else "w"
+    all_ref = [(d, fs, True) for d, fs in confirmed_ref] + [(d, fs, False) for d, fs in uncertain_ref]
+    all_gl  = [(d, fs, True) for d, fs in confirmed_gliders] + [(d, fs, False) for d, fs in uncertain_gliders]
+    try:
+        with nc.Dataset(path, mode, format="NETCDF4") as ds:
+            ds.setncattr("sep_aviso_date", aviso_sep_date.strftime("%Y-%m-%d"))
+            if "forecast_strlen" not in ds.dimensions:
+                ds.createDimension("forecast_strlen", 10)
+            if all_ref:
+                n = len(all_ref)
+                if "n_sep_ref" not in ds.dimensions:
+                    ds.createDimension("n_sep_ref", n)
+                fs_v = ds.createVariable("sep_ref_forecast_start", "S1", ("n_sep_ref", "forecast_strlen"))
+                fs_v.long_name = "forecast start REF separation (YYYY-MM-DD)"
+                div_v = ds.createVariable("sep_ref_divergence_days", "i4", "n_sep_ref")
+                div_v.long_name = "divergence (days): REF final separation − AVISO final separation"
+                conf_v = ds.createVariable("sep_ref_confirmed", "i1", "n_sep_ref")
+                conf_v.long_name = "1=confirmed (>=30 days), 0=uncertain"
+                for i, (d, fs, is_conf) in enumerate(all_ref):
+                    fs_v[i, :] = list(fs.strftime("%Y-%m-%d").ljust(10)[:10])
+                    div_v[i] = int(d)
+                    conf_v[i] = int(is_conf)
+            if all_gl:
+                n = len(all_gl)
+                if "n_sep_gliders" not in ds.dimensions:
+                    ds.createDimension("n_sep_gliders", n)
+                fs_v = ds.createVariable("sep_gliders_forecast_start", "S1", ("n_sep_gliders", "forecast_strlen"))
+                fs_v.long_name = "forecast start GLIDERS separation (YYYY-MM-DD)"
+                div_v = ds.createVariable("sep_gliders_divergence_days", "i4", "n_sep_gliders")
+                div_v.long_name = "divergence (days): GLIDERS final separation − AVISO final separation"
+                conf_v = ds.createVariable("sep_gliders_confirmed", "i1", "n_sep_gliders")
+                conf_v.long_name = "1=confirmed (>=30 days), 0=uncertain"
+                for i, (d, fs, is_conf) in enumerate(all_gl):
+                    fs_v[i, :] = list(fs.strftime("%Y-%m-%d").ljust(10)[:10])
+                    div_v[i] = int(d)
+                    conf_v[i] = int(is_conf)
+        print(f"Wrote separation timing to {path} (REF: {len(all_ref)}, GLIDERS: {len(all_gl)})")
+    except Exception as e:
+        print(f"Warning: could not save separation timing to {path}: {e}")
+
+
+def load_separation_timing_from_netcdf(
+    path: str,
+) -> Tuple[Optional[datetime], List[Tuple[int, datetime, bool]], List[Tuple[int, datetime, bool]]]:
+    """Load separation timing from lce_timing_OSEs.nc. Returns (aviso_sep_date, ref_items, gliders_items).
+    Each item is (divergence_days, forecast_start, is_confirmed)."""
+    if nc is None or not os.path.isfile(path):
+        return None, [], []
+    try:
+        with nc.Dataset(path, "r") as ds:
+            aviso_str = ds.getncattr("sep_aviso_date") if "sep_aviso_date" in ds.ncattrs() else None
+            if aviso_str is None:
+                return None, [], []
+            aviso_sep_date = datetime.strptime(aviso_str[:10], "%Y-%m-%d")
+
+            def _read_sep(prefix, dim):
+                items = []
+                if dim not in ds.dimensions:
+                    return items
+                n = len(ds.dimensions[dim])
+                fs_v = ds.variables.get(f"{prefix}_forecast_start")
+                div_v = ds.variables.get(f"{prefix}_divergence_days")
+                conf_v = ds.variables.get(f"{prefix}_confirmed")
+                if fs_v is None or div_v is None:
+                    return items
+                div_arr = div_v[:]
+                conf_arr = conf_v[:] if conf_v is not None else [1] * n
+                for i in range(n):
+                    fs_str = (
+                        fs_v[i, :].tobytes().decode("ascii", errors="ignore")
+                        if hasattr(fs_v[i, :], "tobytes")
+                        else "".join(str(c) for c in fs_v[i, :])
+                    ).strip()
+                    if not fs_str:
+                        continue
+                    try:
+                        fs_dt = datetime.strptime(fs_str[:10], "%Y-%m-%d")
+                    except ValueError:
+                        continue
+                    items.append((int(div_arr[i]), fs_dt, bool(conf_arr[i])))
+                return items
+
+            ref_items = _read_sep("sep_ref", "n_sep_ref")
+            gl_items  = _read_sep("sep_gliders", "n_sep_gliders")
+            return aviso_sep_date, ref_items, gl_items
+    except Exception as e:
+        print(f"Warning: could not load separation timing from {path}: {e}")
+        return None, [], []
+
+
+def save_detachment_counts_to_netcdf(
+    counts_ref: List[Tuple[datetime, int, int]],
+    counts_gliders: List[Tuple[datetime, int, int]],
+    output_dir: str,
+    filename: str = "lce_timing_OSEs.nc",
+    aviso_total: Optional[int] = None,
+) -> None:
+    """Append LCE detachment counts to lce_timing_OSEs.nc (creates file if absent).
+    counts_*: list of (forecast_start, model_count, aviso_count_per_forecast).
+    aviso_total: total AVISO detachments over the full time series (global attribute)."""
+    if nc is None:
+        return
+    path = os.path.join(output_dir, filename)
+    mode = "a" if os.path.isfile(path) else "w"
+    try:
+        with nc.Dataset(path, mode, format="NETCDF4") as ds:
+            if aviso_total is not None:
+                ds.setncattr("det_aviso_total", int(aviso_total))
+            if "forecast_strlen" not in ds.dimensions:
+                ds.createDimension("forecast_strlen", 10)
+            if counts_ref:
+                n = len(counts_ref)
+                if "n_det_ref" not in ds.dimensions:
+                    ds.createDimension("n_det_ref", n)
+                if "det_ref_forecast_start" not in ds.variables:
+                    v = ds.createVariable("det_ref_forecast_start", "S1", ("n_det_ref", "forecast_strlen"))
+                    v.long_name = "forecast start REF detachment count (YYYY-MM-DD)"
+                if "det_ref_model_count" not in ds.variables:
+                    v = ds.createVariable("det_ref_model_count", "i4", "n_det_ref")
+                    v.long_name = "REF model detachment count per forecast"
+                if "det_ref_aviso_count" not in ds.variables:
+                    v = ds.createVariable("det_ref_aviso_count", "i4", "n_det_ref")
+                    v.long_name = "AVISO detachment count per forecast window (REF)"
+                for i, (fs_dt, mc, ac) in enumerate(counts_ref):
+                    ds.variables["det_ref_forecast_start"][i, :] = list(fs_dt.strftime("%Y-%m-%d").ljust(10)[:10])
+                    ds.variables["det_ref_model_count"][i] = int(mc)
+                    ds.variables["det_ref_aviso_count"][i] = int(ac)
+            if counts_gliders:
+                n = len(counts_gliders)
+                if "n_det_gliders" not in ds.dimensions:
+                    ds.createDimension("n_det_gliders", n)
+                if "det_gliders_forecast_start" not in ds.variables:
+                    v = ds.createVariable("det_gliders_forecast_start", "S1", ("n_det_gliders", "forecast_strlen"))
+                    v.long_name = "forecast start GLIDERS detachment count (YYYY-MM-DD)"
+                if "det_gliders_model_count" not in ds.variables:
+                    v = ds.createVariable("det_gliders_model_count", "i4", "n_det_gliders")
+                    v.long_name = "GLIDERS model detachment count per forecast"
+                if "det_gliders_aviso_count" not in ds.variables:
+                    v = ds.createVariable("det_gliders_aviso_count", "i4", "n_det_gliders")
+                    v.long_name = "AVISO detachment count per forecast window (GLIDERS)"
+                for i, (fs_dt, mc, ac) in enumerate(counts_gliders):
+                    ds.variables["det_gliders_forecast_start"][i, :] = list(fs_dt.strftime("%Y-%m-%d").ljust(10)[:10])
+                    ds.variables["det_gliders_model_count"][i] = int(mc)
+                    ds.variables["det_gliders_aviso_count"][i] = int(ac)
+        print(f"Wrote detachment counts to {path} (REF: {len(counts_ref)}, GLIDERS: {len(counts_gliders)}, AVISO total: {aviso_total})")
+    except Exception as e:
+        print(f"Warning: could not save detachment counts to {path}: {e}")
+
+
+def load_detachment_counts_from_netcdf(
+    path: str,
+) -> Tuple[List[Tuple[datetime, int, int]], List[Tuple[datetime, int, int]], Optional[int]]:
+    """Load detachment counts from lce_timing_OSEs.nc.
+    Returns (counts_ref, counts_gliders, aviso_total) where counts_* are (forecast_start, model_count, aviso_count)."""
+    counts_ref: List[Tuple[datetime, int, int]] = []
+    counts_gliders: List[Tuple[datetime, int, int]] = []
+    aviso_total: Optional[int] = None
+    if nc is None or not os.path.isfile(path):
+        return counts_ref, counts_gliders, aviso_total
+    try:
+        with nc.Dataset(path, "r") as ds:
+            if "det_aviso_total" in ds.ncattrs():
+                aviso_total = int(ds.getncattr("det_aviso_total"))
+
+            def _read_det(prefix, dim):
+                items = []
+                if dim not in ds.dimensions:
+                    return items
+                n = len(ds.dimensions[dim])
+                fs_v = ds.variables.get(f"{prefix}_forecast_start")
+                mc_v = ds.variables.get(f"{prefix}_model_count")
+                ac_v = ds.variables.get(f"{prefix}_aviso_count")
+                if fs_v is None or mc_v is None:
+                    return items
+                mc_arr = mc_v[:]
+                ac_arr = ac_v[:] if ac_v is not None else [0] * n
+                for i in range(n):
+                    fs_str = (
+                        fs_v[i, :].tobytes().decode("ascii", errors="ignore")
+                        if hasattr(fs_v[i, :], "tobytes")
+                        else "".join(str(c) for c in fs_v[i, :])
+                    ).strip()
+                    if not fs_str:
+                        continue
+                    try:
+                        fs_dt = datetime.strptime(fs_str[:10], "%Y-%m-%d")
+                    except ValueError:
+                        continue
+                    items.append((fs_dt, int(mc_arr[i]), int(ac_arr[i])))
+                return items
+
+            counts_ref = _read_det("det_ref", "n_det_ref")
+            counts_gliders = _read_det("det_gliders", "n_det_gliders")
+    except Exception as e:
+        print(f"Warning: could not load detachment counts from {path}: {e}")
+        return [], [], None
+    return counts_ref, counts_gliders, aviso_total
+
+
+def save_forecast_summary_table(
+    output_dir: str,
+    ref_label: str,
+    gliders_label: str,
+    counts_ref: List[Tuple[datetime, int]],
+    counts_gliders: List[Tuple[datetime, int]],
+    aviso_total: Optional[int],
+    no_sep_ref: List[datetime],
+    no_sep_gliders: List[datetime],
+    filename: str = "forecast_summary.txt",
+) -> None:
+    """Write a text table summarising forecasts with no model detachments and forecasts with no model separation."""
+    path = os.path.join(output_dir, filename)
+    lines = []
+    lines.append("=" * 60)
+    lines.append("FORECAST SUMMARY")
+    lines.append("=" * 60)
+
+    # --- Section 1: no model detachments ---
+    aviso_str = f" (AVISO full-series total: {aviso_total})" if aviso_total is not None else ""
+    lines.append(f"\n[1] Forecasts with NO model detachments{aviso_str}")
+    lines.append("-" * 60)
+    for label, counts in [(ref_label, counts_ref), (gliders_label, counts_gliders)]:
+        no_det = [fs.strftime("%Y-%m-%d") for fs, mc, *_ in counts if mc == 0]
+        if no_det:
+            lines.append(f"  {label}:")
+            for d in no_det:
+                lines.append(f"    {d}")
+        else:
+            lines.append(f"  {label}: all forecasts had ≥1 detachment")
+
+    # --- Section 2: no model final separation ---
+    lines.append(f"\n[2] Forecasts with NO model final separation detected")
+    lines.append("-" * 60)
+    for label, no_sep in [(ref_label, no_sep_ref), (gliders_label, no_sep_gliders)]:
+        if no_sep:
+            lines.append(f"  {label}:")
+            for fs in sorted(no_sep):
+                lines.append(f"    {fs.strftime('%Y-%m-%d')}")
+        else:
+            lines.append(f"  {label}: all forecasts had a separation detected")
+
+    lines.append("")
+    with open(path, "w") as f:
+        f.write("\n".join(lines))
+    print(f"Wrote forecast summary to {path}")
 
 
 def extract_forecast_start_from_hycom_path(base_dir_ref: str) -> Optional[datetime]:
@@ -1985,7 +2880,14 @@ if __name__ == "__main__":
     parser.add_argument("--animate-all", action="store_true", dest="animate_all", help="With --animate: produce one animation per forecast/group (HYCOM forecasts or NetCDF subfolders).")
     parser.add_argument("--timeseries", action="store_true", help="Produce MHD time series plot (all forecasts, lead time vs MHD)")
     parser.add_argument("--timeseries-by-date", action="store_true", dest="timeseries_by_date", help="Produce MHD time series vs actual date (mean ± std across forecasts)")
-    parser.add_argument("--no-lce", action="store_true", dest="no_lce", help="Also produce timeseries/mean-std plots using LC-only MHD (no LCE); saves mhd_OSEs_lc_only.nc")
+    parser.add_argument("--no-lce-timeseries", action="store_true", dest="no_lce_timeseries", help="Plot LC-only MHD timeseries (no LCE detection); saves mhd_OSEs_lc_only.nc")
+    parser.add_argument("--no-lce-timeseries-by-date", action="store_true", dest="no_lce_timeseries_by_date", help="Plot LC-only MHD timeseries by date (no LCE detection); saves mhd_OSEs_lc_only.nc")
+    parser.add_argument("--no-lce-mean-std", action="store_true", dest="no_lce_mean_std", help="Plot LC-only MHD mean±std (no LCE detection); saves mhd_OSEs_lc_only.nc")
+    parser.add_argument("--mean-std-by-date", action="store_true", dest="mean_std_by_date", help="Plot MHD mean±std vs actual date")
+    parser.add_argument("--no-lce-mean-std-by-date", action="store_true", dest="no_lce_mean_std_by_date", help="Plot LC-only MHD mean±std vs actual date (no LCE detection); saves mhd_OSEs_lc_only.nc")
+    parser.add_argument("--no-lon-span-filter", action="store_true", dest="no_lon_span_filter", help="Disable the min_lon_span=1.3° LCE filter (allow narrow LCEs)")
+    parser.add_argument("--detachment-count", action="store_true", dest="detachment_count", help="Plot LCE detachment count per forecast (model vs AVISO grouped bar chart)")
+    parser.add_argument("--separation-timing", action="store_true", dest="separation_timing", help="Plot final LC separation timing vs AVISO (days early/late) across all forecasts")
     parser.add_argument("--mean-std", action="store_true", help="Produce mean ± std MHD vs lead time (requires forecast start)")
     parser.add_argument("--timing-distribution", action="store_true", help="Produce histogram of first LCE detachment timing (requires forecast start)")
     parser.add_argument("--netcdf-dir", type=str, help="[--no-hycom] Directory containing NetCDF SSH files (REF run)")
@@ -2000,8 +2902,8 @@ if __name__ == "__main__":
     parser.add_argument("--lat-var", type=str, default="latitude", help="[--no-hycom] NetCDF latitude variable")
     parser.add_argument("--ssh-var", type=str, default="ssh", help="[--no-hycom] NetCDF SSH variable")
     parser.add_argument("--ssh-scale", type=float, default=1.0, help="[--no-hycom] Scale SSH to meters (e.g. 0.01 if cm)")
-    parser.add_argument("--model-label", type=str, default="Model", help="[--no-hycom] Legend label for REF run")
-    parser.add_argument("--model-label-gliders", type=str, default="Model_GLIDERS", help="[--no-hycom] Legend label for GLIDERS run")
+    parser.add_argument("--model-label", type=str, default="no_GrASE_HYCOM", help="Legend label for REF run")
+    parser.add_argument("--model-label-gliders", type=str, default="GrASE_HYCOM", help="Legend label for GLIDERS run")
     parser.add_argument("--grid-netcdf", type=str, default=None, help="[--no-hycom] NetCDF grid file with cell sizes (for area-weighted demean when --mercator)")
     parser.add_argument("--mercator", action="store_true", help="[--no-hycom] Use area-weighted demean (requires --grid-netcdf with dx/dy or pscx/pscy)")
     parser.add_argument("--grid-dx-var", type=str, default="pscx", help="[--no-hycom] Grid NetCDF variable for cell x-size (default: pscx)")
@@ -2010,14 +2912,20 @@ if __name__ == "__main__":
     parser.add_argument("--max-forecasts", type=int, default=None, metavar="N", help="[--hycom] Use at most N forecasts (for testing). Default: all.")
     args = parser.parse_args()
 
-    if not (args.animate or args.timeseries or args.timeseries_by_date or args.no_lce or args.mean_std or args.timing_distribution):
+    if not (args.animate or args.timeseries or args.timeseries_by_date or args.no_lce_timeseries or args.no_lce_timeseries_by_date or args.no_lce_mean_std or args.mean_std or args.mean_std_by_date or args.no_lce_mean_std_by_date or args.timing_distribution or args.detachment_count or args.separation_timing):
         parser.error("At least one of --animate, --timeseries, --mean-std, --timing-distribution is required.")
     lon_cutoff = -81.0
+    lce_min_lon_span = 0.0 if args.no_lon_span_filter else 1.3
+    lon_filter_suffix = "_no_lon_filter" if args.no_lon_span_filter else ""
     use_cutoff = True
     results_ref_all = None
     results_gliders_all = None
     timing_only_data_ref = None  # List of (forecast_start, divergence_days) when --timing-distribution (light path)
     timing_only_data_gliders = None
+    detachment_count_data_ref = None     # List of (forecast_start, model_count, aviso_count) when --detachment-count
+    detachment_count_data_gliders = None
+    aviso_date_max_lat: Optional[Dict[datetime, float]] = None
+    aviso_total_detachments_from_nc: Optional[int] = None
     animate_all_done = False  # True when --animate-all produced one MP4 per forecast
 
     if args.hycom:
@@ -2040,20 +2948,66 @@ if __name__ == "__main__":
             return files_ref, files_gliders, grid_file_ref, grid_file_gliders, aviso_dir, mdt_path, forecast_start
 
         need_animation = args.animate
-        need_rest = args.timeseries or args.timeseries_by_date or args.no_lce or args.mean_std or args.timing_distribution
+        need_rest = args.timeseries or args.timeseries_by_date or args.no_lce_timeseries or args.no_lce_timeseries_by_date or args.no_lce_mean_std or args.mean_std or args.mean_std_by_date or args.no_lce_mean_std_by_date or args.timing_distribution or args.detachment_count or args.separation_timing
         results_ref = []
         results_gliders = []
         forecast_start_dt = None
 
-        # If we only need timing-distribution and an existing timing NetCDF is present, load it and skip HYCOM.
-        if args.timing_distribution and not (args.timeseries or args.timeseries_by_date or args.mean_std or args.animate):
+        ref_label = args.model_label
+        gliders_label = args.model_label_gliders
+
+        # If we only need timing/detachment/separation and an existing timing NetCDF is present, load and skip HYCOM.
+        _light_only = not (args.timeseries or args.timeseries_by_date or args.mean_std or args.animate)
+        _wants_nc = (args.timing_distribution or args.detachment_count or args.separation_timing) and _light_only
+        if _wants_nc:
             timing_nc_path = os.path.join(OUTPUT_DIR, "lce_timing_OSEs.nc")
             if os.path.isfile(timing_nc_path):
-                loaded_ref, loaded_gliders = load_lce_timing_from_netcdf(timing_nc_path)
-                if loaded_ref or loaded_gliders:
-                    print(f"[Timing-only] Using existing timing NetCDF {timing_nc_path} (REF {len(loaded_ref)}, GLIDERS {len(loaded_gliders)})")
-                    timing_only_data_ref = loaded_ref
-                    timing_only_data_gliders = loaded_gliders
+                _all_loaded = True
+                # --- timing distribution ---
+                if args.timing_distribution:
+                    loaded_ref, loaded_gliders, _ = load_lce_timing_from_netcdf(timing_nc_path)
+                    if loaded_ref or loaded_gliders:
+                        print(f"[Timing-only] Loaded from {timing_nc_path} (REF {len(loaded_ref)}, GLIDERS {len(loaded_gliders)})")
+                        timing_only_data_ref = loaded_ref
+                        timing_only_data_gliders = loaded_gliders
+                    else:
+                        print("[Timing-only] No timing data in nc. Will recompute.")
+                        _all_loaded = False
+                # --- detachment count ---
+                if args.detachment_count and _all_loaded:
+                    det_ref_nc, det_gl_nc, det_aviso_nc = load_detachment_counts_from_netcdf(timing_nc_path)
+                    if det_ref_nc or det_gl_nc:
+                        print(f"[Detachment] Loaded from {timing_nc_path} (REF {len(det_ref_nc)}, GLIDERS {len(det_gl_nc)}, AVISO total={det_aviso_nc})")
+                        detachment_count_data_ref = det_ref_nc
+                        detachment_count_data_gliders = det_gl_nc
+                        aviso_total_detachments_from_nc = det_aviso_nc
+                    else:
+                        print("[Detachment] No detachment data in nc. Will recompute.")
+                        _all_loaded = False
+                # --- separation timing ---
+                if args.separation_timing and _all_loaded:
+                    aviso_sep_date_nc, ref_items_nc, gl_items_nc = load_separation_timing_from_netcdf(timing_nc_path)
+                    if aviso_sep_date_nc is not None and (ref_items_nc or gl_items_nc):
+                        print(f"[Separation] Loaded from {timing_nc_path} (AVISO sep {aviso_sep_date_nc.strftime('%Y-%m-%d')}, REF {len(ref_items_nc)}, GLIDERS {len(gl_items_nc)})")
+                        # reconstruct confirmed/uncertain lists: items are (divergence_days, forecast_start, is_confirmed)
+                        conf_ref_nc = [(d, fs) for d, fs, c in ref_items_nc if c]
+                        unc_ref_nc  = [(d, fs) for d, fs, c in ref_items_nc if not c]
+                        conf_gl_nc  = [(d, fs) for d, fs, c in gl_items_nc  if c]
+                        unc_gl_nc   = [(d, fs) for d, fs, c in gl_items_nc  if not c]
+                        plot_separation_timing(conf_ref_nc, unc_ref_nc, conf_gl_nc, unc_gl_nc,
+                                               OUTPUT_DIR, ref_label=ref_label, gliders_label=gliders_label,
+                                               aviso_sep_date=aviso_sep_date_nc)
+                        save_forecast_summary_table(
+                            OUTPUT_DIR, ref_label, gliders_label,
+                            detachment_count_data_ref or [],
+                            detachment_count_data_gliders or [],
+                            aviso_total_detachments_from_nc if args.detachment_count else None,
+                            [], [],  # no_sep lists not available from nc
+                        )
+                    else:
+                        print("[Separation] No separation data in nc. Will recompute.")
+                        _all_loaded = False
+                if _all_loaded:
                     need_rest = False
 
         if need_animation and getattr(args, "animate_all", False):
@@ -2082,6 +3036,7 @@ if __name__ == "__main__":
                         hycom_file=hycom_file, grid_file=grid_ref,
                         aviso_dir=aviso_dir, mdt_path=mdt_path,
                         lon_cutoff=lon_cutoff, use_cutoff=use_cutoff,
+                        lce_min_lon_span=lce_min_lon_span,
                     )
                     anim_ref.append(result)
                     sys.stdout.flush()
@@ -2092,6 +3047,7 @@ if __name__ == "__main__":
                         hycom_file=hycom_file, grid_file=grid_gliders,
                         aviso_dir=aviso_dir, mdt_path=mdt_path,
                         lon_cutoff=lon_cutoff, use_cutoff=use_cutoff,
+                        lce_min_lon_span=lce_min_lon_span,
                     )
                     anim_gliders.append(result)
                     sys.stdout.flush()
@@ -2122,6 +3078,7 @@ if __name__ == "__main__":
                     hycom_file=hycom_file, grid_file=grid_file_ref,
                     aviso_dir=aviso_dir, mdt_path=mdt_path,
                     lon_cutoff=lon_cutoff, use_cutoff=use_cutoff,
+                    lce_min_lon_span=lce_min_lon_span,
                 )
                 if forecast_start_dt is not None:
                     result["forecast_start"] = forecast_start_dt
@@ -2140,6 +3097,7 @@ if __name__ == "__main__":
                     hycom_file=hycom_file, grid_file=grid_file_gliders,
                     aviso_dir=aviso_dir, mdt_path=mdt_path,
                     lon_cutoff=lon_cutoff, use_cutoff=use_cutoff,
+                    lce_min_lon_span=lce_min_lon_span,
                 )
                 if forecast_start_dt is not None:
                     result["forecast_start"] = forecast_start_dt
@@ -2152,7 +3110,7 @@ if __name__ == "__main__":
                         print(f"  Date: {result['date']}, MHD: NaN (no east-of-90W overlap)")
                 sys.stdout.flush()
 
-        need_full_processing = args.timeseries or args.timeseries_by_date or args.no_lce or args.mean_std
+        need_full_processing = args.timeseries or args.timeseries_by_date or args.mean_std or args.mean_std_by_date
         if need_rest:
             configs = get_model_data_config_hycom_all()
             if getattr(args, "max_forecasts", None) is not None:
@@ -2162,50 +3120,210 @@ if __name__ == "__main__":
                 print("Error: No HYCOM forecasts found. Check HYCOM_BASE_FORECAST_DIR and get_model_data_config_hycom_all().")
                 if not need_animation:
                     sys.exit(1)
-            elif args.timing_distribution and not need_full_processing:
-                # Light path: timing only – contours + max_lat, no SSH/LCE/MHD
-                print(f"[Timing only – lightweight] Found {len(configs)} forecasts")
-                print("=" * 60)
-                timing_only_data_ref = []
-                timing_only_data_gliders = []
-                for cfg_idx, (files_ref, files_gliders, grid_ref, grid_gliders, aviso_dir, mdt_path, fs_dt) in enumerate(configs):
+            elif (args.timing_distribution or args.detachment_count or args.separation_timing or args.no_lce_timeseries or args.no_lce_timeseries_by_date or args.no_lce_mean_std or args.no_lce_mean_std_by_date) and not need_full_processing:
+                # Light path: timing/detachment/lc-only – LC contours only, no LCE detection
+                lc_only_loaded = False
+                if args.no_lce_timeseries or args.no_lce_timeseries_by_date or args.no_lce_mean_std or args.no_lce_mean_std_by_date:
+                    lc_only_nc_path = os.path.join(OUTPUT_DIR, "mhd_OSEs_lc_only.nc")
+                    if os.path.isfile(lc_only_nc_path):
+                        print(f"[LC-only] Loading from existing {lc_only_nc_path}")
+                        lc_only_results_ref, lc_only_results_gliders = load_mhd_from_netcdf(lc_only_nc_path)
+                        if lc_only_results_ref or lc_only_results_gliders:
+                            print(f"  Loaded REF: {len(lc_only_results_ref)}, GLIDERS: {len(lc_only_results_gliders)}")
+                            lc_only_loaded = True
+                        else:
+                            print("  Load failed or file empty. Recomputing...")
+                    if not lc_only_loaded:
+                        lc_only_results_ref = []
+                        lc_only_results_gliders = []
+                need_loop = (args.timing_distribution or args.detachment_count or args.separation_timing or not lc_only_loaded)
+                if need_loop:
+                    print(f"[Timing/detachment/LC-only – lightweight] Found {len(configs)} forecasts")
+                    print("=" * 60)
+                    if args.timing_distribution:
+                        timing_only_data_ref = []
+                        timing_only_data_gliders = []
+                    if args.detachment_count:
+                        detachment_count_data_ref = []
+                        detachment_count_data_gliders = []
+                    if args.separation_timing or args.detachment_count:
+                        aviso_date_max_lat = {}
+                        sep_series_ref: List[Tuple[datetime, List[Tuple[datetime, float]], Dict[datetime, bool]]] = []
+                        sep_series_gliders: List[Tuple[datetime, List[Tuple[datetime, float]], Dict[datetime, bool]]] = []
+                for cfg_idx, (files_ref, files_gliders, grid_ref, grid_gliders, aviso_dir, mdt_path, fs_dt) in (enumerate(configs) if need_loop else []):
                     print(f"  Forecast {cfg_idx + 1}/{len(configs)}: {fs_dt.strftime('%Y-%m-%d')} ({len(files_ref)} REF, {len(files_gliders)} GLIDERS files)")
                     series_ref_model, series_ref_aviso = [], []
+                    lce_ref_by_lead: Dict[int, bool] = {}
+                    lce_ref_by_lead_det: Dict[int, bool] = {}
+                    sep_ref_model_this: List[Tuple[datetime, float]] = []
+                    sep_ref_lce_this: Dict[datetime, bool] = {}
                     for hycom_file in files_ref:
-                        out = process_hycom_file_for_timing_only(
-                            hycom_file, grid_ref, aviso_dir, mdt_path, fs_dt, lon_cutoff=lon_cutoff
-                        )
-                        if out is not None:
-                            lead, max_m, max_a = out
-                            if max_m is not None:
-                                series_ref_model.append((lead, max_m))
-                            if max_a is not None:
-                                series_ref_aviso.append((lead, max_a))
+                        if args.timing_distribution or args.detachment_count or args.separation_timing:
+                            out = process_hycom_file_for_timing_only(
+                                hycom_file, grid_ref, aviso_dir, mdt_path, fs_dt, lon_cutoff=lon_cutoff,
+                                detect_lce=True, lce_min_lon_span=lce_min_lon_span,
+                                sep_min_lon=-91.5 if args.separation_timing else None,
+                                det_min_lon=-91.5 if args.detachment_count else None,
+                            )
+                            if out is not None:
+                                if len(out) == 6:
+                                    lead, max_m, max_a, has_lce_timing, has_lce_sep, has_lce_det = out
+                                else:
+                                    lead, max_m, max_a = out[:3]
+                                    has_lce_timing = has_lce_sep = has_lce_det = False
+                                if max_m is not None:
+                                    series_ref_model.append((lead, max_m))
+                                    lce_ref_by_lead[lead] = has_lce_timing
+                                    lce_ref_by_lead_det[lead] = has_lce_det
+                                if max_a is not None:
+                                    series_ref_aviso.append((lead, max_a))
+                                if args.separation_timing or args.detachment_count:
+                                    actual_date = fs_dt + timedelta(days=lead)
+                                    if args.separation_timing:
+                                        if max_m is not None:
+                                            sep_ref_model_this.append((actual_date, max_m))
+                                            sep_ref_lce_this[actual_date] = has_lce_sep
+                                    if max_a is not None and actual_date not in aviso_date_max_lat:
+                                        aviso_date_max_lat[actual_date] = max_a
+                        if args.no_lce_timeseries or args.no_lce_timeseries_by_date or args.no_lce_mean_std or args.no_lce_mean_std_by_date:
+                            r = process_hycom_file_for_lc_only_mhd(
+                                hycom_file, grid_ref, aviso_dir, mdt_path, fs_dt, lon_cutoff=lon_cutoff
+                            )
+                            if r is not None:
+                                lc_only_results_ref.append(r)
                     series_ref_model.sort(key=lambda x: x[0])
                     series_ref_aviso.sort(key=lambda x: x[0])
-                    d = compute_divergence_from_series(series_ref_model, series_ref_aviso)
-                    if d is not None:
-                        timing_only_data_ref.append((fs_dt, d))
+                    if args.timing_distribution:
+                        d = compute_divergence_from_series(series_ref_model, series_ref_aviso,
+                                                           lead_has_lce_model=lce_ref_by_lead)
+                        if d is not None:
+                            aviso_offset_ref = first_detachment_day_from_max_lat_series(series_ref_aviso)
+                            timing_only_data_ref.append((fs_dt, d, aviso_offset_ref))
+                    if args.detachment_count:
+                        detachment_count_data_ref.append((
+                            fs_dt,
+                            count_detachments_from_max_lat_series(series_ref_model, lead_has_lce=lce_ref_by_lead_det),
+                            count_detachments_from_max_lat_series(series_ref_aviso),
+                        ))
+                    if args.separation_timing and sep_ref_model_this:
+                        sep_series_ref.append((fs_dt, sep_ref_model_this, sep_ref_lce_this))
                     series_gliders_model, series_gliders_aviso = [], []
+                    lce_gliders_by_lead: Dict[int, bool] = {}
+                    lce_gliders_by_lead_det: Dict[int, bool] = {}
+                    sep_gliders_model_this: List[Tuple[datetime, float]] = []
+                    sep_gliders_lce_this: Dict[datetime, bool] = {}
                     for hycom_file in files_gliders:
-                        out = process_hycom_file_for_timing_only(
-                            hycom_file, grid_gliders, aviso_dir, mdt_path, fs_dt, lon_cutoff=lon_cutoff
-                        )
-                        if out is not None:
-                            lead, max_m, max_a = out
-                            if max_m is not None:
-                                series_gliders_model.append((lead, max_m))
-                            if max_a is not None:
-                                series_gliders_aviso.append((lead, max_a))
+                        if args.timing_distribution or args.detachment_count or args.separation_timing:
+                            out = process_hycom_file_for_timing_only(
+                                hycom_file, grid_gliders, aviso_dir, mdt_path, fs_dt, lon_cutoff=lon_cutoff,
+                                detect_lce=True, lce_min_lon_span=lce_min_lon_span,
+                                sep_min_lon=-91.5 if args.separation_timing else None,
+                                det_min_lon=-91.5 if args.detachment_count else None,
+                            )
+                            if out is not None:
+                                if len(out) == 6:
+                                    lead, max_m, max_a, has_lce_timing, has_lce_sep, has_lce_det = out
+                                else:
+                                    lead, max_m, max_a = out[:3]
+                                    has_lce_timing = has_lce_sep = has_lce_det = False
+                                if max_m is not None:
+                                    series_gliders_model.append((lead, max_m))
+                                    lce_gliders_by_lead[lead] = has_lce_timing
+                                    lce_gliders_by_lead_det[lead] = has_lce_det
+                                if max_a is not None:
+                                    series_gliders_aviso.append((lead, max_a))
+                                if args.separation_timing or args.detachment_count:
+                                    actual_date = fs_dt + timedelta(days=lead)
+                                    if args.separation_timing:
+                                        if max_m is not None:
+                                            sep_gliders_model_this.append((actual_date, max_m))
+                                            sep_gliders_lce_this[actual_date] = has_lce_sep
+                                    if max_a is not None and actual_date not in aviso_date_max_lat:
+                                        aviso_date_max_lat[actual_date] = max_a
+                        if args.no_lce_timeseries or args.no_lce_timeseries_by_date or args.no_lce_mean_std or args.no_lce_mean_std_by_date:
+                            r = process_hycom_file_for_lc_only_mhd(
+                                hycom_file, grid_gliders, aviso_dir, mdt_path, fs_dt, lon_cutoff=lon_cutoff
+                            )
+                            if r is not None:
+                                lc_only_results_gliders.append(r)
                     series_gliders_model.sort(key=lambda x: x[0])
                     series_gliders_aviso.sort(key=lambda x: x[0])
-                    d = compute_divergence_from_series(series_gliders_model, series_gliders_aviso)
-                    if d is not None:
-                        timing_only_data_gliders.append((fs_dt, d))
+                    if args.timing_distribution:
+                        d = compute_divergence_from_series(series_gliders_model, series_gliders_aviso,
+                                                           lead_has_lce_model=lce_gliders_by_lead)
+                        if d is not None:
+                            aviso_offset_gl = first_detachment_day_from_max_lat_series(series_gliders_aviso)
+                            timing_only_data_gliders.append((fs_dt, d, aviso_offset_gl))
+                    if args.detachment_count:
+                        detachment_count_data_gliders.append((
+                            fs_dt,
+                            count_detachments_from_max_lat_series(series_gliders_model, lead_has_lce=lce_gliders_by_lead_det),
+                            count_detachments_from_max_lat_series(series_gliders_aviso),
+                        ))
+                    if args.separation_timing and sep_gliders_model_this:
+                        sep_series_gliders.append((fs_dt, sep_gliders_model_this, sep_gliders_lce_this))
                     sys.stdout.flush()
+                if (args.no_lce_timeseries or args.no_lce_timeseries_by_date or args.no_lce_mean_std or args.no_lce_mean_std_by_date):
+                    if not lc_only_loaded:
+                        save_mhd_to_netcdf(lc_only_results_ref, lc_only_results_gliders, OUTPUT_DIR, filename="mhd_OSEs_lc_only.nc")
+                    if args.no_lce_timeseries:
+                        plot_timeseries_all_forecasts(lc_only_results_ref, lc_only_results_gliders, OUTPUT_DIR, suffix="_lc_only")
+                    if args.no_lce_timeseries_by_date:
+                        plot_timeseries_by_date(lc_only_results_ref, lc_only_results_gliders, OUTPUT_DIR, suffix="_lc_only")
+                    if args.no_lce_mean_std:
+                        plot_mean_std_from_results(lc_only_results_ref, lc_only_results_gliders, None, OUTPUT_DIR, suffix="_lc_only")
+                    if args.no_lce_mean_std_by_date:
+                        plot_mean_std_by_date(lc_only_results_ref, lc_only_results_gliders, OUTPUT_DIR, suffix="_lc_only")
+                if args.separation_timing:
+                    aviso_series = sorted(aviso_date_max_lat.items())
+                    aviso_sep_date, aviso_confirmed = detect_final_separation(aviso_series)
+                    if aviso_sep_date is None or not aviso_confirmed:
+                        print("[Separation timing] Could not confirm final LC separation in AVISO. Skip histogram.")
+                    else:
+                        print(f"[Separation timing] AVISO final separation: {aviso_sep_date.strftime('%Y-%m-%d')}")
+                        def _compute_sep_divergences(sep_series_model, label):
+                            confirmed_items = []  # (divergence_days, forecast_start_date)
+                            uncertain_items = []
+                            no_sep_forecasts = []  # forecast_start_date with no separation detected
+                            for fs_dt_i, date_ml, lce_dict in sep_series_model:
+                                sep_date, is_confirmed = detect_final_separation(date_ml, date_has_lce=lce_dict)
+                                if sep_date is not None:
+                                    div = (sep_date - aviso_sep_date).days
+                                    if is_confirmed:
+                                        confirmed_items.append((div, fs_dt_i))
+                                    else:
+                                        uncertain_items.append((div, fs_dt_i))
+                                else:
+                                    no_sep_forecasts.append(fs_dt_i)
+                            all_items = sorted(confirmed_items + uncertain_items, key=lambda x: x[0])
+                            for div, fs_dt_i in all_items:
+                                tag = "confirmed" if (div, fs_dt_i) in confirmed_items else "uncertain"
+                                print(f"  [{label}] {tag} separation: forecast {fs_dt_i.strftime('%Y-%m-%d')} (divergence {div:+d} days)")
+                            if all_items:
+                                all_divs = [d for d, _ in all_items]
+                                print(f"  [{label}] {len(confirmed_items)} confirmed, {len(uncertain_items)} uncertain; mean divergence: {np.mean(all_divs):.1f} days, std: {np.std(all_divs):.1f} days")
+                            else:
+                                print(f"  [{label}] No separations detected.")
+                            return confirmed_items, uncertain_items, no_sep_forecasts
+                        conf_ref, unc_ref, no_sep_ref = _compute_sep_divergences(sep_series_ref, ref_label)
+                        conf_gl, unc_gl, no_sep_gl = _compute_sep_divergences(sep_series_gliders, gliders_label)
+                        plot_separation_timing(conf_ref, unc_ref, conf_gl, unc_gl, OUTPUT_DIR, ref_label=ref_label, gliders_label=gliders_label, aviso_sep_date=aviso_sep_date)
+                        timing_nc_path = os.path.join(OUTPUT_DIR, "lce_timing_OSEs.nc")
+                        save_separation_timing_to_netcdf(aviso_sep_date, conf_ref, unc_ref, conf_gl, unc_gl, OUTPUT_DIR)
+                        _aviso_tot_for_table: Optional[int] = None
+                        if aviso_date_max_lat is not None and aviso_date_max_lat:
+                            _aviso_det_ord = [(d.toordinal(), lat) for d, lat in sorted(aviso_date_max_lat.items())]
+                            _aviso_tot_for_table = count_detachments_from_max_lat_series(_aviso_det_ord)
+                        save_forecast_summary_table(
+                            OUTPUT_DIR, ref_label, gliders_label,
+                            detachment_count_data_ref or [],
+                            detachment_count_data_gliders or [],
+                            _aviso_tot_for_table,
+                            no_sep_ref, no_sep_gl,
+                        )
             else:
                 # Full path: timeseries and/or mean_std (and possibly timing from results)
-                mhd_path = os.path.join(OUTPUT_DIR, "mhd_OSEs.nc")
+                mhd_path = os.path.join(OUTPUT_DIR, f"mhd_OSEs{lon_filter_suffix}.nc")
                 if os.path.isfile(mhd_path):
                     print(f"[Timeseries/mean-std] Loading MHD from existing {mhd_path}")
                     results_ref_all, results_gliders_all = load_mhd_from_netcdf(mhd_path)
@@ -2216,44 +3334,84 @@ if __name__ == "__main__":
                     else:
                         print(f"  Loaded REF: {len(results_ref_all)}, GLIDERS: {len(results_gliders_all)}")
                 if results_ref_all is not None and results_gliders_all is not None:
-                    if args.timing_distribution:
-                        # No contours in file; run light path for timing
-                        timing_only_data_ref = []
-                        timing_only_data_gliders = []
+                    if args.timing_distribution or args.detachment_count:
+                        # No contours in file; run light path for timing/detachment
+                        if args.timing_distribution:
+                            timing_only_data_ref = []
+                            timing_only_data_gliders = []
+                        if args.detachment_count:
+                            detachment_count_data_ref = []
+                            detachment_count_data_gliders = []
                         for cfg_idx, (files_ref, files_gliders, grid_ref, grid_gliders, aviso_dir, mdt_path, fs_dt) in enumerate(configs):
                             print(f"  Forecast {cfg_idx + 1}/{len(configs)}: {fs_dt.strftime('%Y-%m-%d')} (timing)...")
                             series_ref_model, series_ref_aviso = [], []
+                            lce_ref_by_lead_fp: Dict[int, bool] = {}
+                            lce_ref_by_lead_fp_det: Dict[int, bool] = {}
                             for hycom_file in files_ref:
                                 out = process_hycom_file_for_timing_only(
-                                    hycom_file, grid_ref, aviso_dir, mdt_path, fs_dt, lon_cutoff=lon_cutoff
+                                    hycom_file, grid_ref, aviso_dir, mdt_path, fs_dt, lon_cutoff=lon_cutoff,
+                                    detect_lce=True, lce_min_lon_span=lce_min_lon_span,
+                                    det_min_lon=-91.5 if args.detachment_count else None,
                                 )
                                 if out is not None:
-                                    lead, max_m, max_a = out
+                                    if len(out) == 6:
+                                        lead, max_m, max_a, has_lce_timing, _, has_lce_det = out
+                                    else:
+                                        lead, max_m, max_a = out[:3]
+                                        has_lce_timing = has_lce_det = False
                                     if max_m is not None:
                                         series_ref_model.append((lead, max_m))
+                                        lce_ref_by_lead_fp[lead] = has_lce_timing
+                                        lce_ref_by_lead_fp_det[lead] = has_lce_det
                                     if max_a is not None:
                                         series_ref_aviso.append((lead, max_a))
                             series_ref_model.sort(key=lambda x: x[0])
                             series_ref_aviso.sort(key=lambda x: x[0])
-                            d = compute_divergence_from_series(series_ref_model, series_ref_aviso)
-                            if d is not None:
-                                timing_only_data_ref.append((fs_dt, d))
+                            if args.timing_distribution:
+                                d = compute_divergence_from_series(series_ref_model, series_ref_aviso,
+                                                                   lead_has_lce_model=lce_ref_by_lead_fp)
+                                if d is not None:
+                                    timing_only_data_ref.append((fs_dt, d))
+                            if args.detachment_count:
+                                detachment_count_data_ref.append((
+                                    fs_dt,
+                                    count_detachments_from_max_lat_series(series_ref_model, lead_has_lce=lce_ref_by_lead_fp_det),
+                                    count_detachments_from_max_lat_series(series_ref_aviso),
+                                ))
                             series_gliders_model, series_gliders_aviso = [], []
+                            lce_gliders_by_lead_fp: Dict[int, bool] = {}
+                            lce_gliders_by_lead_fp_det: Dict[int, bool] = {}
                             for hycom_file in files_gliders:
                                 out = process_hycom_file_for_timing_only(
-                                    hycom_file, grid_gliders, aviso_dir, mdt_path, fs_dt, lon_cutoff=lon_cutoff
+                                    hycom_file, grid_gliders, aviso_dir, mdt_path, fs_dt, lon_cutoff=lon_cutoff,
+                                    detect_lce=True, lce_min_lon_span=lce_min_lon_span,
+                                    det_min_lon=-91.5 if args.detachment_count else None,
                                 )
                                 if out is not None:
-                                    lead, max_m, max_a = out
+                                    if len(out) == 6:
+                                        lead, max_m, max_a, has_lce_timing, _, has_lce_det = out
+                                    else:
+                                        lead, max_m, max_a = out[:3]
+                                        has_lce_timing = has_lce_det = False
                                     if max_m is not None:
                                         series_gliders_model.append((lead, max_m))
+                                        lce_gliders_by_lead_fp[lead] = has_lce_timing
+                                        lce_gliders_by_lead_fp_det[lead] = has_lce_det
                                     if max_a is not None:
                                         series_gliders_aviso.append((lead, max_a))
                             series_gliders_model.sort(key=lambda x: x[0])
                             series_gliders_aviso.sort(key=lambda x: x[0])
-                            d = compute_divergence_from_series(series_gliders_model, series_gliders_aviso)
-                            if d is not None:
-                                timing_only_data_gliders.append((fs_dt, d))
+                            if args.timing_distribution:
+                                d = compute_divergence_from_series(series_gliders_model, series_gliders_aviso,
+                                                                   lead_has_lce_model=lce_gliders_by_lead_fp)
+                                if d is not None:
+                                    timing_only_data_gliders.append((fs_dt, d))
+                            if args.detachment_count:
+                                detachment_count_data_gliders.append((
+                                    fs_dt,
+                                    count_detachments_from_max_lat_series(series_gliders_model, lead_has_lce=lce_gliders_by_lead_fp_det),
+                                    count_detachments_from_max_lat_series(series_gliders_aviso),
+                                ))
                             sys.stdout.flush()
                     if need_animation and not results_ref:
                         forecast_start_dt = configs[0][6]
@@ -2272,6 +3430,7 @@ if __name__ == "__main__":
                                 hycom_file=hycom_file, grid_file=grid_ref,
                                 aviso_dir=aviso_dir, mdt_path=mdt_path,
                                 lon_cutoff=lon_cutoff, use_cutoff=use_cutoff,
+                                lce_min_lon_span=lce_min_lon_span,
                             )
                             result["forecast_start"] = fs_dt
                             results_ref_all.append(result)
@@ -2280,6 +3439,7 @@ if __name__ == "__main__":
                                 hycom_file=hycom_file, grid_file=grid_gliders,
                                 aviso_dir=aviso_dir, mdt_path=mdt_path,
                                 lon_cutoff=lon_cutoff, use_cutoff=use_cutoff,
+                                lce_min_lon_span=lce_min_lon_span,
                             )
                             result["forecast_start"] = fs_dt
                             results_gliders_all.append(result)
@@ -2290,7 +3450,6 @@ if __name__ == "__main__":
                         results_ref = results_ref_all
                         results_gliders = results_gliders_all
 
-        ref_label, gliders_label = "HYCOM_REF", "HYCOM_GLIDERS"
 
     elif args.multi_simulation:
         # ---------------------------------------------------------------------
@@ -2317,7 +3476,7 @@ if __name__ == "__main__":
             pattern = os.path.join(nc_dir, args.netcdf_pattern)
             nc_files = sorted(glob.glob(pattern))
             nc_files = [f for f in nc_files if os.path.isfile(f) and f.endswith(".nc")]
-            nc_files = [f for f in nc_files if os.path.basename(f) != "mhd_OSEs.nc"]
+            nc_files = [f for f in nc_files if not os.path.basename(f).startswith("mhd_OSEs")]
             pairs = []
             for f in nc_files:
                 date_str = extract_date_from_netcdf_path(f)
@@ -2372,6 +3531,7 @@ if __name__ == "__main__":
                     mercator=getattr(args, "mercator", False),
                     grid_dx_var=getattr(args, "grid_dx_var", "pscx"),
                     grid_dy_var=getattr(args, "grid_dy_var", "pscy"),
+                    lce_min_lon_span=lce_min_lon_span,
                 )
                 if fs_for_file is not None:
                     result["forecast_start"] = fs_for_file
@@ -2437,6 +3597,7 @@ if __name__ == "__main__":
                                 mercator=getattr(args, "mercator", False),
                                 grid_dx_var=getattr(args, "grid_dx_var", "pscx"),
                                 grid_dy_var=getattr(args, "grid_dy_var", "pscy"),
+                                lce_min_lon_span=lce_min_lon_span,
                             )
                             if group_fs is not None:
                                 result["forecast_start"] = group_fs
@@ -2553,7 +3714,7 @@ if __name__ == "__main__":
         if getattr(args, "mercator", False) and not getattr(args, "grid_netcdf", None):
             parser.error("--mercator requires --grid-netcdf (path to NetCDF grid file with cell sizes)")
         need_animation = args.animate
-        need_rest = args.timeseries or args.timeseries_by_date or args.no_lce or args.mean_std or args.timing_distribution
+        need_rest = args.timeseries or args.timeseries_by_date or args.no_lce_timeseries or args.no_lce_timeseries_by_date or args.no_lce_mean_std or args.mean_std or args.mean_std_by_date or args.no_lce_mean_std_by_date or args.timing_distribution or args.detachment_count or args.separation_timing
         forecast_start_dt = None
         if args.forecast_start:
             try:
@@ -2566,7 +3727,7 @@ if __name__ == "__main__":
             nc_files = sorted(glob.glob(pattern))
             nc_files = [f for f in nc_files if os.path.isfile(f) and f.endswith(".nc")]
             # Do not treat our own MHD output as model input
-            nc_files = [f for f in nc_files if os.path.basename(f) != "mhd_OSEs.nc"]
+            nc_files = [f for f in nc_files if not os.path.basename(f).startswith("mhd_OSEs")]
             pairs = []
             for f in nc_files:
                 date_str = extract_date_from_netcdf_path(f)
@@ -2616,6 +3777,7 @@ if __name__ == "__main__":
                         mercator=getattr(args, "mercator", False),
                         grid_dx_var=getattr(args, "grid_dx_var", "pscx"),
                         grid_dy_var=getattr(args, "grid_dy_var", "pscy"),
+                        lce_min_lon_span=lce_min_lon_span,
                     )
                     if group_fs is not None:
                         result["forecast_start"] = group_fs
@@ -2634,6 +3796,7 @@ if __name__ == "__main__":
                         mercator=getattr(args, "mercator", False),
                         grid_dx_var=getattr(args, "grid_dx_var", "pscx"),
                         grid_dy_var=getattr(args, "grid_dy_var", "pscy"),
+                        lce_min_lon_span=lce_min_lon_span,
                     )
                     if group_fs is not None:
                         result["forecast_start"] = group_fs
@@ -2681,6 +3844,7 @@ if __name__ == "__main__":
                     mercator=getattr(args, "mercator", False),
                     grid_dx_var=getattr(args, "grid_dx_var", "pscx"),
                     grid_dy_var=getattr(args, "grid_dy_var", "pscy"),
+                    lce_min_lon_span=lce_min_lon_span,
                 )
                 if fs_for_file is not None:
                     result["forecast_start"] = fs_for_file
@@ -2708,6 +3872,7 @@ if __name__ == "__main__":
                             mercator=getattr(args, "mercator", False),
                             grid_dx_var=getattr(args, "grid_dx_var", "pscx"),
                             grid_dy_var=getattr(args, "grid_dy_var", "pscy"),
+                            lce_min_lon_span=lce_min_lon_span,
                         )
                         if fs_for_file is not None:
                             result["forecast_start"] = fs_for_file
@@ -2734,8 +3899,12 @@ if __name__ == "__main__":
         if len(results_gliders) > 0:
             print(f"Model (GLIDERS): {len(results_gliders)} results")
         if len(results_ref) == 0:
-            if args.animate and animate_all_done and not (args.timeseries or args.mean_std or args.timing_distribution):
+            if args.animate and animate_all_done and not (args.timeseries or args.mean_std or args.timing_distribution or args.detachment_count):
                 print("Animation-all completed; skipping REF-results check for non-plot run.")
+            elif args.detachment_count and not (args.timeseries or args.timeseries_by_date or args.mean_std or args.animate):
+                pass  # lightweight detachment path: results_ref is empty by design
+            elif (args.no_lce_timeseries or args.no_lce_timeseries_by_date or args.no_lce_mean_std or args.no_lce_mean_std_by_date or args.separation_timing) and not (args.timeseries or args.timeseries_by_date or args.mean_std or args.mean_std_by_date or args.animate):
+                pass  # lightweight lc-only / separation-timing path: results_ref is empty by design
             else:
                 print("Error: No REF results.")
                 sys.exit(1)
@@ -2758,56 +3927,61 @@ if __name__ == "__main__":
     ref_for_rest = results_ref_all if results_ref_all is not None else results_ref
     gliders_for_rest = results_gliders_all if results_gliders_all is not None else results_gliders
 
-    save_mhd_to_netcdf(ref_for_rest, gliders_for_rest, OUTPUT_DIR, filename="mhd_OSEs.nc")
+    if need_full_processing:
+        save_mhd_to_netcdf(ref_for_rest, gliders_for_rest, OUTPUT_DIR, filename=f"mhd_OSEs{lon_filter_suffix}.nc")
 
     if args.timeseries:
         plot_timeseries_all_forecasts(
-            ref_for_rest, gliders_for_rest, OUTPUT_DIR, ref_label=ref_label, gliders_label=gliders_label
+            ref_for_rest, gliders_for_rest, OUTPUT_DIR, ref_label=ref_label, gliders_label=gliders_label,
+            suffix=lon_filter_suffix,
         )
     if args.timeseries_by_date:
         plot_timeseries_by_date(
-            ref_for_rest, gliders_for_rest, OUTPUT_DIR, ref_label=ref_label, gliders_label=gliders_label
+            ref_for_rest, gliders_for_rest, OUTPUT_DIR, ref_label=ref_label, gliders_label=gliders_label,
+            suffix=lon_filter_suffix,
         )
-    if args.no_lce:
-        lc_only_ref = _lc_only_results(ref_for_rest)
-        lc_only_gl = _lc_only_results(gliders_for_rest)
-        save_mhd_to_netcdf(lc_only_ref, lc_only_gl, OUTPUT_DIR, filename="mhd_OSEs_lc_only.nc")
-        if args.timeseries:
-            plot_timeseries_all_forecasts(
-                lc_only_ref, lc_only_gl, OUTPUT_DIR, ref_label=ref_label, gliders_label=gliders_label, suffix="_lc_only"
-            )
-        if args.timeseries_by_date:
-            plot_timeseries_by_date(
-                lc_only_ref, lc_only_gl, OUTPUT_DIR, ref_label=ref_label, gliders_label=gliders_label, suffix="_lc_only"
-            )
-        if args.mean_std:
-            plot_mean_std_from_results(
-                lc_only_ref, lc_only_gl, None, OUTPUT_DIR,
-                ref_label=ref_label, gliders_label=gliders_label, suffix="_lc_only",
-            )
+    if args.mean_std_by_date:
+        plot_mean_std_by_date(
+            ref_for_rest, gliders_for_rest, OUTPUT_DIR, ref_label=ref_label, gliders_label=gliders_label,
+            suffix=lon_filter_suffix,
+        )
     if args.mean_std:
         if results_ref_all is not None:
             plot_mean_std_from_results(
                 ref_for_rest, gliders_for_rest, None, OUTPUT_DIR,
                 ref_label=ref_label, gliders_label=gliders_label,
+                suffix=lon_filter_suffix,
             )
         elif forecast_start_dt is not None:
             plot_mean_std_from_results(
                 results_ref, results_gliders, forecast_start_dt, OUTPUT_DIR,
                 ref_label=ref_label, gliders_label=gliders_label,
+                suffix=lon_filter_suffix,
             )
         else:
             print("Skipping mean-std: no forecast start date (set --forecast-start for NetCDF or check HYCOM path).")
+    if args.no_lce_mean_std or args.no_lce_mean_std_by_date or args.no_lce_timeseries or args.no_lce_timeseries_by_date:
+        lc_only_ref = _lc_only_results(ref_for_rest)
+        lc_only_gl  = _lc_only_results(gliders_for_rest)
+        save_mhd_to_netcdf(lc_only_ref, lc_only_gl, OUTPUT_DIR, filename="mhd_OSEs_lc_only.nc")
+        if args.no_lce_timeseries:
+            plot_timeseries_all_forecasts(lc_only_ref, lc_only_gl, OUTPUT_DIR, ref_label=ref_label, gliders_label=gliders_label, suffix="_lc_only")
+        if args.no_lce_timeseries_by_date:
+            plot_timeseries_by_date(lc_only_ref, lc_only_gl, OUTPUT_DIR, ref_label=ref_label, gliders_label=gliders_label, suffix="_lc_only")
+        if args.no_lce_mean_std:
+            plot_mean_std_from_results(lc_only_ref, lc_only_gl, None, OUTPUT_DIR, ref_label=ref_label, gliders_label=gliders_label, suffix="_lc_only")
+        if args.no_lce_mean_std_by_date:
+            plot_mean_std_by_date(lc_only_ref, lc_only_gl, OUTPUT_DIR, ref_label=ref_label, gliders_label=gliders_label, suffix="_lc_only")
     if args.timing_distribution:
         # If a timing NetCDF already exists, read from it and do not recompute
         timing_nc_path = os.path.join(OUTPUT_DIR, "lce_timing_OSEs.nc")
         loaded_from_nc = False
         if os.path.isfile(timing_nc_path):
-            timing_ref_loaded, timing_gliders_loaded = load_lce_timing_from_netcdf(timing_nc_path)
+            timing_ref_loaded, timing_gliders_loaded, _ = load_lce_timing_from_netcdf(timing_nc_path)
             if timing_ref_loaded or timing_gliders_loaded:
                 plot_timing_distribution(
-                    [d for (_, d) in timing_ref_loaded],
-                    [d for (_, d) in timing_gliders_loaded],
+                    timing_ref_loaded,
+                    timing_gliders_loaded,
                     OUTPUT_DIR,
                     ref_label=ref_label,
                     gliders_label=gliders_label,
@@ -2821,8 +3995,8 @@ if __name__ == "__main__":
             timing_data_gliders = []
             if timing_only_data_ref is not None or timing_only_data_gliders is not None:
                 plot_timing_distribution(
-                    [d for (_, d) in (timing_only_data_ref or [])],
-                    [d for (_, d) in (timing_only_data_gliders or [])],
+                    timing_only_data_ref or [],
+                    timing_only_data_gliders or [],
                     OUTPUT_DIR,
                     ref_label=ref_label,
                     gliders_label=gliders_label,
@@ -2848,8 +4022,8 @@ if __name__ == "__main__":
                     if d is not None:
                         timing_data_gliders.append((fs, d))
                 plot_timing_distribution(
-                    [d for (_, d) in timing_data_ref],
-                    [d for (_, d) in timing_data_gliders],
+                    timing_data_ref,
+                    timing_data_gliders,
                     OUTPUT_DIR,
                     ref_label=ref_label, gliders_label=gliders_label,
                 )
@@ -2859,8 +4033,8 @@ if __name__ == "__main__":
                 timing_data_ref = [(forecast_start_dt, div_ref)] if div_ref is not None else []
                 timing_data_gliders = [(forecast_start_dt, div_gliders)] if div_gliders is not None else []
                 plot_timing_distribution(
-                    [div_ref] if div_ref is not None else [],
-                    [div_gliders] if div_gliders is not None else [],
+                    timing_data_ref,
+                    timing_data_gliders,
                     OUTPUT_DIR,
                     ref_label=ref_label,
                     gliders_label=gliders_label,
@@ -2869,4 +4043,29 @@ if __name__ == "__main__":
                 print("Skipping timing-distribution: no forecast start date (set --forecast-start for NetCDF or check HYCOM path).")
             if timing_data_ref or timing_data_gliders:
                 save_lce_timing_to_netcdf(timing_data_ref, timing_data_gliders, OUTPUT_DIR, filename="lce_timing_OSEs.nc")
+    if args.detachment_count:
+        if detachment_count_data_ref is not None or detachment_count_data_gliders is not None:
+            aviso_total_detachments: Optional[int] = aviso_total_detachments_from_nc
+            if aviso_date_max_lat is not None:
+                aviso_series_full = sorted(aviso_date_max_lat.items())
+                if aviso_series_full:
+                    aviso_det_by_ord = [(d.toordinal(), lat) for d, lat in aviso_series_full]
+                    aviso_total_detachments = count_detachments_from_max_lat_series(aviso_det_by_ord)
+                    print(f"[Detachment count] AVISO total detachments (full time series): {aviso_total_detachments}")
+            plot_detachment_counts(
+                detachment_count_data_ref or [],
+                detachment_count_data_gliders or [],
+                OUTPUT_DIR,
+                ref_label=ref_label,
+                gliders_label=gliders_label,
+                aviso_total=aviso_total_detachments,
+            )
+            save_detachment_counts_to_netcdf(
+                detachment_count_data_ref or [],
+                detachment_count_data_gliders or [],
+                OUTPUT_DIR,
+                aviso_total=aviso_total_detachments,
+            )
+        else:
+            print("Skipping detachment-count: no data computed (check HYCOM path).")
 

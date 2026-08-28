@@ -124,10 +124,20 @@ def largest_contour_17cm(lon: np.ndarray, lat: np.ndarray, ssh: np.ndarray, leve
         if seg is None or len(seg) < 2:
             continue
         seg = np.asarray(seg)
+        if _is_closed(seg):
+            continue
         if len(seg) > best_len:
             best = seg
             best_len = len(seg)
     return best
+
+
+def has_lce_17cm(lon: np.ndarray, lat: np.ndarray, ssh: np.ndarray, level_m: float = 0.17) -> bool:
+    """Return True if any closed 17 cm contour exists (i.e. an LCE is present)."""
+    for seg in all_contours_17cm(lon, lat, ssh, level_m=level_m):
+        if _is_closed(seg):
+            return True
+    return False
 
 
 def all_contours_17cm(lon: np.ndarray, lat: np.ndarray, ssh: np.ndarray, level_m: float = 0.17) -> List[np.ndarray]:
@@ -341,7 +351,7 @@ def load_ssh_aviso_plus_mdt(aviso_nc_path: str, mdt_path: str, time_index: int =
 def get_aviso_contour_from_ssh(lon: np.ndarray, lat: np.ndarray, ssh: np.ndarray, level_cm: float = 17.0) -> Optional[np.ndarray]:
     """Compute LC contour from already-loaded AVISO (lon, lat, ssh). Demean over GOM (-99 to -81, 18-30N). No file I/O."""
     ssh = demean_region(ssh, lon, lat, DEMEAN_BBOX)
-    return largest_contour_range(lon, lat, ssh, level_m=level_cm / 100.0)
+    return largest_contour_17cm(lon, lat, ssh, level_m=level_cm / 100.0)
 
 
 def get_aviso_contours_only(date: str, aviso_dir: str, mdt_path: str, level_cm: float = 17.0, bbox: Tuple[float, float, float, float] = GOM_BBOX_FOR_CONTOURS) -> Optional[np.ndarray]:
@@ -359,13 +369,16 @@ def get_aviso_contours_only(date: str, aviso_dir: str, mdt_path: str, level_cm: 
     return get_aviso_contour_from_ssh(lon, lat, ssh_gom, level_cm=level_cm)
 
 
-def get_hycom_aviso_contours(hycom_archv_file: str, hycom_grid_file: str, date: str, aviso_dir: str, mdt_path: str, level_cm: float = 17.0, bbox: Tuple[float, float, float, float] = GOM_BBOX_FOR_CONTOURS, aviso_data: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+def get_hycom_aviso_contours(hycom_archv_file: str, hycom_grid_file: str, date: str, aviso_dir: str, mdt_path: str, level_cm: float = 17.0, bbox: Tuple[float, float, float, float] = GOM_BBOX_FOR_CONTOURS, aviso_data: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None, load_aviso: bool = True) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     """Get HYCOM and AVISO contours for date. GOM -99 to -81 demean; LC contour has no lon restriction. Returns (contour_hycom, contour_aviso).
-    If aviso_data is (lon_av, lat_av, ssh_av), use it to compute contour_aviso (no AVISO file load)."""
+    If aviso_data is (lon_av, lat_av, ssh_av), use it to compute contour_aviso (no AVISO file load).
+    If load_aviso=False, skip AVISO entirely and return (contour_hycom, None)."""
     lon_hycom, lat_hycom, ssh_dm = load_ssh_and_grid_hycom(hycom_archv_file, hycom_grid_file)
     ssh_hycom = ssh_dm / 10.0  # dm -> m
     ssh_hycom = demean_region_hycom(ssh_hycom, lon_hycom, lat_hycom, hycom_grid_file, DEMEAN_BBOX)
-    contour_hycom = largest_contour_range(lon_hycom, lat_hycom, ssh_hycom, level_m=level_cm / 100.0)
+    contour_hycom = largest_contour_17cm(lon_hycom, lat_hycom, ssh_hycom, level_m=level_cm / 100.0)
+    if not load_aviso:
+        return contour_hycom, None
     if not (AVISO_DATE_START <= date <= AVISO_DATE_END):
         return contour_hycom, None
     if aviso_data is not None:
@@ -388,4 +401,4 @@ def get_model_contour_from_ssh(lon: np.ndarray, lat: np.ndarray, ssh: np.ndarray
     """Compute LC contour from model (lon, lat, ssh). Optionally demean first."""
     if demean:
         ssh = demean_region(ssh, lon, lat, DEMEAN_BBOX)
-    return largest_contour_range(lon, lat, ssh, level_m=level_m)
+    return largest_contour_17cm(lon, lat, ssh, level_m=level_m)
