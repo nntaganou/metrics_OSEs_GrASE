@@ -3334,85 +3334,165 @@ if __name__ == "__main__":
                     else:
                         print(f"  Loaded REF: {len(results_ref_all)}, GLIDERS: {len(results_gliders_all)}")
                 if results_ref_all is not None and results_gliders_all is not None:
-                    if args.timing_distribution or args.detachment_count:
-                        # No contours in file; run light path for timing/detachment
+                    if args.timing_distribution or args.detachment_count or args.separation_timing:
+                        # No contours in cache file; run light path for timing/detachment/separation
                         if args.timing_distribution:
                             timing_only_data_ref = []
                             timing_only_data_gliders = []
                         if args.detachment_count:
                             detachment_count_data_ref = []
                             detachment_count_data_gliders = []
+                        if args.separation_timing or args.detachment_count:
+                            aviso_date_max_lat = {}
+                        if args.separation_timing:
+                            sep_series_ref_fp: List = []
+                            sep_series_gliders_fp: List = []
                         for cfg_idx, (files_ref, files_gliders, grid_ref, grid_gliders, aviso_dir, mdt_path, fs_dt) in enumerate(configs):
                             print(f"  Forecast {cfg_idx + 1}/{len(configs)}: {fs_dt.strftime('%Y-%m-%d')} (timing)...")
                             series_ref_model, series_ref_aviso = [], []
                             lce_ref_by_lead_fp: Dict[int, bool] = {}
                             lce_ref_by_lead_fp_det: Dict[int, bool] = {}
+                            sep_ref_model_this_fp: List = []
+                            sep_ref_lce_this_fp: Dict = {}
                             for hycom_file in files_ref:
                                 out = process_hycom_file_for_timing_only(
                                     hycom_file, grid_ref, aviso_dir, mdt_path, fs_dt, lon_cutoff=lon_cutoff,
                                     detect_lce=True, lce_min_lon_span=lce_min_lon_span,
                                     det_min_lon=-91.5 if args.detachment_count else None,
+                                    sep_min_lon=-91.5 if args.separation_timing else None,
                                 )
                                 if out is not None:
                                     if len(out) == 6:
-                                        lead, max_m, max_a, has_lce_timing, _, has_lce_det = out
+                                        lead, max_m, max_a, has_lce_timing, has_lce_sep, has_lce_det = out
                                     else:
                                         lead, max_m, max_a = out[:3]
-                                        has_lce_timing = has_lce_det = False
+                                        has_lce_timing = has_lce_sep = has_lce_det = False
                                     if max_m is not None:
                                         series_ref_model.append((lead, max_m))
                                         lce_ref_by_lead_fp[lead] = has_lce_timing
                                         lce_ref_by_lead_fp_det[lead] = has_lce_det
                                     if max_a is not None:
                                         series_ref_aviso.append((lead, max_a))
+                                    if args.separation_timing or args.detachment_count:
+                                        actual_date = fs_dt + timedelta(days=lead)
+                                        if args.separation_timing:
+                                            if max_m is not None:
+                                                sep_ref_model_this_fp.append((actual_date, max_m))
+                                                sep_ref_lce_this_fp[actual_date] = has_lce_sep
+                                        if max_a is not None and actual_date not in aviso_date_max_lat:
+                                            aviso_date_max_lat[actual_date] = max_a
                             series_ref_model.sort(key=lambda x: x[0])
                             series_ref_aviso.sort(key=lambda x: x[0])
                             if args.timing_distribution:
                                 d = compute_divergence_from_series(series_ref_model, series_ref_aviso,
                                                                    lead_has_lce_model=lce_ref_by_lead_fp)
                                 if d is not None:
-                                    timing_only_data_ref.append((fs_dt, d))
+                                    aviso_offset_ref = first_detachment_day_from_max_lat_series(series_ref_aviso)
+                                    timing_only_data_ref.append((fs_dt, d, aviso_offset_ref))
                             if args.detachment_count:
                                 detachment_count_data_ref.append((
                                     fs_dt,
                                     count_detachments_from_max_lat_series(series_ref_model, lead_has_lce=lce_ref_by_lead_fp_det),
                                     count_detachments_from_max_lat_series(series_ref_aviso),
                                 ))
+                            if args.separation_timing and sep_ref_model_this_fp:
+                                sep_series_ref_fp.append((fs_dt, sep_ref_model_this_fp, sep_ref_lce_this_fp))
                             series_gliders_model, series_gliders_aviso = [], []
                             lce_gliders_by_lead_fp: Dict[int, bool] = {}
                             lce_gliders_by_lead_fp_det: Dict[int, bool] = {}
+                            sep_gliders_model_this_fp: List = []
+                            sep_gliders_lce_this_fp: Dict = {}
                             for hycom_file in files_gliders:
                                 out = process_hycom_file_for_timing_only(
                                     hycom_file, grid_gliders, aviso_dir, mdt_path, fs_dt, lon_cutoff=lon_cutoff,
                                     detect_lce=True, lce_min_lon_span=lce_min_lon_span,
                                     det_min_lon=-91.5 if args.detachment_count else None,
+                                    sep_min_lon=-91.5 if args.separation_timing else None,
                                 )
                                 if out is not None:
                                     if len(out) == 6:
-                                        lead, max_m, max_a, has_lce_timing, _, has_lce_det = out
+                                        lead, max_m, max_a, has_lce_timing, has_lce_sep, has_lce_det = out
                                     else:
                                         lead, max_m, max_a = out[:3]
-                                        has_lce_timing = has_lce_det = False
+                                        has_lce_timing = has_lce_sep = has_lce_det = False
                                     if max_m is not None:
                                         series_gliders_model.append((lead, max_m))
                                         lce_gliders_by_lead_fp[lead] = has_lce_timing
                                         lce_gliders_by_lead_fp_det[lead] = has_lce_det
                                     if max_a is not None:
                                         series_gliders_aviso.append((lead, max_a))
+                                    if args.separation_timing or args.detachment_count:
+                                        actual_date = fs_dt + timedelta(days=lead)
+                                        if args.separation_timing:
+                                            if max_m is not None:
+                                                sep_gliders_model_this_fp.append((actual_date, max_m))
+                                                sep_gliders_lce_this_fp[actual_date] = has_lce_sep
+                                        if max_a is not None and actual_date not in aviso_date_max_lat:
+                                            aviso_date_max_lat[actual_date] = max_a
                             series_gliders_model.sort(key=lambda x: x[0])
                             series_gliders_aviso.sort(key=lambda x: x[0])
                             if args.timing_distribution:
                                 d = compute_divergence_from_series(series_gliders_model, series_gliders_aviso,
                                                                    lead_has_lce_model=lce_gliders_by_lead_fp)
                                 if d is not None:
-                                    timing_only_data_gliders.append((fs_dt, d))
+                                    aviso_offset_gliders = first_detachment_day_from_max_lat_series(series_gliders_aviso)
+                                    timing_only_data_gliders.append((fs_dt, d, aviso_offset_gliders))
                             if args.detachment_count:
                                 detachment_count_data_gliders.append((
                                     fs_dt,
                                     count_detachments_from_max_lat_series(series_gliders_model, lead_has_lce=lce_gliders_by_lead_fp_det),
                                     count_detachments_from_max_lat_series(series_gliders_aviso),
                                 ))
+                            if args.separation_timing and sep_gliders_model_this_fp:
+                                sep_series_gliders_fp.append((fs_dt, sep_gliders_model_this_fp, sep_gliders_lce_this_fp))
                             sys.stdout.flush()
+                        if args.separation_timing:
+                            aviso_series_fp = sorted(aviso_date_max_lat.items())
+                            aviso_sep_date_fp, aviso_confirmed_fp = detect_final_separation(aviso_series_fp)
+                            if aviso_sep_date_fp is None or not aviso_confirmed_fp:
+                                print("[Separation timing] Could not confirm final LC separation in AVISO. Skip histogram.")
+                            else:
+                                print(f"[Separation timing] AVISO final separation: {aviso_sep_date_fp.strftime('%Y-%m-%d')}")
+                                def _compute_sep_div_fp(sep_series_model, label):
+                                    confirmed_items = []
+                                    uncertain_items = []
+                                    no_sep_forecasts = []
+                                    for fs_dt_i, date_ml, lce_dict in sep_series_model:
+                                        sep_date, is_confirmed = detect_final_separation(date_ml, date_has_lce=lce_dict)
+                                        if sep_date is not None:
+                                            div = (sep_date - aviso_sep_date_fp).days
+                                            if is_confirmed:
+                                                confirmed_items.append((div, fs_dt_i))
+                                            else:
+                                                uncertain_items.append((div, fs_dt_i))
+                                        else:
+                                            no_sep_forecasts.append(fs_dt_i)
+                                    all_items = sorted(confirmed_items + uncertain_items, key=lambda x: x[0])
+                                    for div, fs_dt_i in all_items:
+                                        tag = "confirmed" if (div, fs_dt_i) in confirmed_items else "uncertain"
+                                        print(f"  [{label}] {tag} separation: forecast {fs_dt_i.strftime('%Y-%m-%d')} (divergence {div:+d} days)")
+                                    if all_items:
+                                        all_divs = [d for d, _ in all_items]
+                                        print(f"  [{label}] {len(confirmed_items)} confirmed, {len(uncertain_items)} uncertain; mean: {np.mean(all_divs):.1f} days, std: {np.std(all_divs):.1f} days")
+                                    else:
+                                        print(f"  [{label}] No separations detected.")
+                                    return confirmed_items, uncertain_items, no_sep_forecasts
+                                conf_ref_fp, unc_ref_fp, no_sep_ref_fp = _compute_sep_div_fp(sep_series_ref_fp, ref_label)
+                                conf_gl_fp, unc_gl_fp, no_sep_gl_fp = _compute_sep_div_fp(sep_series_gliders_fp, gliders_label)
+                                plot_separation_timing(conf_ref_fp, unc_ref_fp, conf_gl_fp, unc_gl_fp, OUTPUT_DIR, ref_label=ref_label, gliders_label=gliders_label, aviso_sep_date=aviso_sep_date_fp)
+                                save_separation_timing_to_netcdf(aviso_sep_date_fp, conf_ref_fp, unc_ref_fp, conf_gl_fp, unc_gl_fp, OUTPUT_DIR)
+                                _aviso_tot_fp: Optional[int] = None
+                                if aviso_date_max_lat:
+                                    _aviso_det_ord_fp = [(d.toordinal(), lat) for d, lat in sorted(aviso_date_max_lat.items())]
+                                    _aviso_tot_fp = count_detachments_from_max_lat_series(_aviso_det_ord_fp)
+                                save_forecast_summary_table(
+                                    OUTPUT_DIR, ref_label, gliders_label,
+                                    detachment_count_data_ref or [],
+                                    detachment_count_data_gliders or [],
+                                    _aviso_tot_fp,
+                                    no_sep_ref_fp, no_sep_gl_fp,
+                                )
+                                aviso_total_detachments_from_nc = _aviso_tot_fp
                     if need_animation and not results_ref:
                         forecast_start_dt = configs[0][6]
                     if not need_animation:
@@ -3444,6 +3524,166 @@ if __name__ == "__main__":
                             result["forecast_start"] = fs_dt
                             results_gliders_all.append(result)
                         sys.stdout.flush()
+                    if args.timing_distribution or args.detachment_count or args.separation_timing:
+                        # Full loop doesn't collect timing; run a separate lightweight pass now
+                        if args.timing_distribution:
+                            timing_only_data_ref = []
+                            timing_only_data_gliders = []
+                        if args.detachment_count:
+                            detachment_count_data_ref = []
+                            detachment_count_data_gliders = []
+                        if args.separation_timing or args.detachment_count:
+                            aviso_date_max_lat = {}
+                        if args.separation_timing:
+                            sep_series_ref2: List = []
+                            sep_series_gliders2: List = []
+                        print(f"[Timing/detachment/separation – lightweight pass] {len(configs)} forecasts")
+                        for cfg_idx, (files_ref, files_gliders, grid_ref, grid_gliders, aviso_dir, mdt_path, fs_dt) in enumerate(configs):
+                            print(f"  Forecast {cfg_idx + 1}/{len(configs)}: {fs_dt.strftime('%Y-%m-%d')} (timing)...")
+                            series_ref_model, series_ref_aviso = [], []
+                            lce_ref_by_lead_fp2: Dict[int, bool] = {}
+                            lce_ref_by_lead_fp2_det: Dict[int, bool] = {}
+                            sep_ref_model_this2: List = []
+                            sep_ref_lce_this2: Dict = {}
+                            for hycom_file in files_ref:
+                                out = process_hycom_file_for_timing_only(
+                                    hycom_file, grid_ref, aviso_dir, mdt_path, fs_dt, lon_cutoff=lon_cutoff,
+                                    detect_lce=True, lce_min_lon_span=lce_min_lon_span,
+                                    det_min_lon=-91.5 if args.detachment_count else None,
+                                    sep_min_lon=-91.5 if args.separation_timing else None,
+                                )
+                                if out is not None:
+                                    if len(out) == 6:
+                                        lead, max_m, max_a, has_lce_timing, has_lce_sep, has_lce_det = out
+                                    else:
+                                        lead, max_m, max_a = out[:3]
+                                        has_lce_timing = has_lce_sep = has_lce_det = False
+                                    if max_m is not None:
+                                        series_ref_model.append((lead, max_m))
+                                        lce_ref_by_lead_fp2[lead] = has_lce_timing
+                                        lce_ref_by_lead_fp2_det[lead] = has_lce_det
+                                    if max_a is not None:
+                                        series_ref_aviso.append((lead, max_a))
+                                    if args.separation_timing or args.detachment_count:
+                                        actual_date = fs_dt + timedelta(days=lead)
+                                        if args.separation_timing:
+                                            if max_m is not None:
+                                                sep_ref_model_this2.append((actual_date, max_m))
+                                                sep_ref_lce_this2[actual_date] = has_lce_sep
+                                        if max_a is not None and actual_date not in aviso_date_max_lat:
+                                            aviso_date_max_lat[actual_date] = max_a
+                            series_ref_model.sort(key=lambda x: x[0])
+                            series_ref_aviso.sort(key=lambda x: x[0])
+                            if args.timing_distribution:
+                                d = compute_divergence_from_series(series_ref_model, series_ref_aviso,
+                                                                   lead_has_lce_model=lce_ref_by_lead_fp2)
+                                if d is not None:
+                                    aviso_offset_ref = first_detachment_day_from_max_lat_series(series_ref_aviso)
+                                    timing_only_data_ref.append((fs_dt, d, aviso_offset_ref))
+                            if args.detachment_count:
+                                detachment_count_data_ref.append((
+                                    fs_dt,
+                                    count_detachments_from_max_lat_series(series_ref_model, lead_has_lce=lce_ref_by_lead_fp2_det),
+                                    count_detachments_from_max_lat_series(series_ref_aviso),
+                                ))
+                            if args.separation_timing and sep_ref_model_this2:
+                                sep_series_ref2.append((fs_dt, sep_ref_model_this2, sep_ref_lce_this2))
+                            series_gliders_model, series_gliders_aviso = [], []
+                            lce_gliders_by_lead_fp2: Dict[int, bool] = {}
+                            lce_gliders_by_lead_fp2_det: Dict[int, bool] = {}
+                            sep_gliders_model_this2: List = []
+                            sep_gliders_lce_this2: Dict = {}
+                            for hycom_file in files_gliders:
+                                out = process_hycom_file_for_timing_only(
+                                    hycom_file, grid_gliders, aviso_dir, mdt_path, fs_dt, lon_cutoff=lon_cutoff,
+                                    detect_lce=True, lce_min_lon_span=lce_min_lon_span,
+                                    det_min_lon=-91.5 if args.detachment_count else None,
+                                    sep_min_lon=-91.5 if args.separation_timing else None,
+                                )
+                                if out is not None:
+                                    if len(out) == 6:
+                                        lead, max_m, max_a, has_lce_timing, has_lce_sep, has_lce_det = out
+                                    else:
+                                        lead, max_m, max_a = out[:3]
+                                        has_lce_timing = has_lce_sep = has_lce_det = False
+                                    if max_m is not None:
+                                        series_gliders_model.append((lead, max_m))
+                                        lce_gliders_by_lead_fp2[lead] = has_lce_timing
+                                        lce_gliders_by_lead_fp2_det[lead] = has_lce_det
+                                    if max_a is not None:
+                                        series_gliders_aviso.append((lead, max_a))
+                                    if args.separation_timing or args.detachment_count:
+                                        actual_date = fs_dt + timedelta(days=lead)
+                                        if args.separation_timing:
+                                            if max_m is not None:
+                                                sep_gliders_model_this2.append((actual_date, max_m))
+                                                sep_gliders_lce_this2[actual_date] = has_lce_sep
+                                        if max_a is not None and actual_date not in aviso_date_max_lat:
+                                            aviso_date_max_lat[actual_date] = max_a
+                            series_gliders_model.sort(key=lambda x: x[0])
+                            series_gliders_aviso.sort(key=lambda x: x[0])
+                            if args.timing_distribution:
+                                d = compute_divergence_from_series(series_gliders_model, series_gliders_aviso,
+                                                                   lead_has_lce_model=lce_gliders_by_lead_fp2)
+                                if d is not None:
+                                    aviso_offset_gliders = first_detachment_day_from_max_lat_series(series_gliders_aviso)
+                                    timing_only_data_gliders.append((fs_dt, d, aviso_offset_gliders))
+                            if args.detachment_count:
+                                detachment_count_data_gliders.append((
+                                    fs_dt,
+                                    count_detachments_from_max_lat_series(series_gliders_model, lead_has_lce=lce_gliders_by_lead_fp2_det),
+                                    count_detachments_from_max_lat_series(series_gliders_aviso),
+                                ))
+                            if args.separation_timing and sep_gliders_model_this2:
+                                sep_series_gliders2.append((fs_dt, sep_gliders_model_this2, sep_gliders_lce_this2))
+                            sys.stdout.flush()
+                        if args.separation_timing:
+                            aviso_series2 = sorted(aviso_date_max_lat.items())
+                            aviso_sep_date2, aviso_confirmed2 = detect_final_separation(aviso_series2)
+                            if aviso_sep_date2 is None or not aviso_confirmed2:
+                                print("[Separation timing] Could not confirm final LC separation in AVISO. Skip histogram.")
+                            else:
+                                print(f"[Separation timing] AVISO final separation: {aviso_sep_date2.strftime('%Y-%m-%d')}")
+                                def _compute_sep_divergences2(sep_series_model, label):
+                                    confirmed_items = []
+                                    uncertain_items = []
+                                    no_sep_forecasts = []
+                                    for fs_dt_i, date_ml, lce_dict in sep_series_model:
+                                        sep_date, is_confirmed = detect_final_separation(date_ml, date_has_lce=lce_dict)
+                                        if sep_date is not None:
+                                            div = (sep_date - aviso_sep_date2).days
+                                            if is_confirmed:
+                                                confirmed_items.append((div, fs_dt_i))
+                                            else:
+                                                uncertain_items.append((div, fs_dt_i))
+                                        else:
+                                            no_sep_forecasts.append(fs_dt_i)
+                                    all_items = sorted(confirmed_items + uncertain_items, key=lambda x: x[0])
+                                    for div, fs_dt_i in all_items:
+                                        tag = "confirmed" if (div, fs_dt_i) in confirmed_items else "uncertain"
+                                        print(f"  [{label}] {tag} separation: forecast {fs_dt_i.strftime('%Y-%m-%d')} (divergence {div:+d} days)")
+                                    if all_items:
+                                        all_divs = [d for d, _ in all_items]
+                                        print(f"  [{label}] {len(confirmed_items)} confirmed, {len(uncertain_items)} uncertain; mean: {np.mean(all_divs):.1f} days, std: {np.std(all_divs):.1f} days")
+                                    else:
+                                        print(f"  [{label}] No separations detected.")
+                                    return confirmed_items, uncertain_items, no_sep_forecasts
+                                conf_ref2, unc_ref2, no_sep_ref2 = _compute_sep_divergences2(sep_series_ref2, ref_label)
+                                conf_gl2, unc_gl2, no_sep_gl2 = _compute_sep_divergences2(sep_series_gliders2, gliders_label)
+                                plot_separation_timing(conf_ref2, unc_ref2, conf_gl2, unc_gl2, OUTPUT_DIR, ref_label=ref_label, gliders_label=gliders_label, aviso_sep_date=aviso_sep_date2)
+                                save_separation_timing_to_netcdf(aviso_sep_date2, conf_ref2, unc_ref2, conf_gl2, unc_gl2, OUTPUT_DIR)
+                                _aviso_tot2: Optional[int] = None
+                                if aviso_date_max_lat:
+                                    _aviso_det_ord2 = [(d.toordinal(), lat) for d, lat in sorted(aviso_date_max_lat.items())]
+                                    _aviso_tot2 = count_detachments_from_max_lat_series(_aviso_det_ord2)
+                                save_forecast_summary_table(
+                                    OUTPUT_DIR, ref_label, gliders_label,
+                                    detachment_count_data_ref or [],
+                                    detachment_count_data_gliders or [],
+                                    _aviso_tot2,
+                                    no_sep_ref2, no_sep_gl2,
+                                )
+                                aviso_total_detachments_from_nc = _aviso_tot2
                     if need_animation and not results_ref:
                         forecast_start_dt = configs[0][6]
                     if not need_animation:
@@ -3973,10 +4213,10 @@ if __name__ == "__main__":
         if args.no_lce_mean_std_by_date:
             plot_mean_std_by_date(lc_only_ref, lc_only_gl, OUTPUT_DIR, ref_label=ref_label, gliders_label=gliders_label, suffix="_lc_only")
     if args.timing_distribution:
-        # If a timing NetCDF already exists, read from it and do not recompute
+        # Load from cached nc only when timing was NOT freshly computed this run
         timing_nc_path = os.path.join(OUTPUT_DIR, "lce_timing_OSEs.nc")
         loaded_from_nc = False
-        if os.path.isfile(timing_nc_path):
+        if timing_only_data_ref is None and timing_only_data_gliders is None and os.path.isfile(timing_nc_path):
             timing_ref_loaded, timing_gliders_loaded, _ = load_lce_timing_from_netcdf(timing_nc_path)
             if timing_ref_loaded or timing_gliders_loaded:
                 plot_timing_distribution(
