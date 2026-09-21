@@ -2457,27 +2457,35 @@ def save_lce_timing_to_netcdf(
     if nc is None:
         return
     path = os.path.join(output_dir, filename)
-    # If file already exists, keep it (timing is meant to be read, not constantly regenerated)
-    if os.path.isfile(path):
-        print(f"{filename} exists, skipping write (timing can be read from it).")
-        return
     if not timing_ref and not timing_gliders:
         return
     _FILL_INT = -9999
-    with nc.Dataset(path, "w", format="NETCDF4") as ds:
+    mode = "a" if os.path.isfile(path) else "w"
+    with nc.Dataset(path, mode, format="NETCDF4") as ds:
         ds.setncattr("title", "LCE timing: forecast_start (YYYY-MM-DD), divergence_days (model first LCE day − AVISO first LCE day)")
-        ds.createDimension("forecast_strlen", 10)
+        if "forecast_strlen" not in ds.dimensions:
+            ds.createDimension("forecast_strlen", 10)
         n_ref = len(timing_ref)
         n_gl = len(timing_gliders)
         if n_ref > 0:
-            ds.createDimension("n_ref", n_ref)
-            fs_ref = ds.createVariable("ref_forecast_start", "S1", ("n_ref", "forecast_strlen"))
-            fs_ref.long_name = "forecast start REF (YYYY-MM-DD)"
-            div_ref = ds.createVariable("ref_divergence_days", "i4", "n_ref")
-            div_ref.long_name = "divergence (days): REF first LCE day − AVISO first LCE day"
-            aviso_off_ref = ds.createVariable("ref_aviso_offset_days", "i4", "n_ref")
-            aviso_off_ref.long_name = "AVISO first LCE lead day within this forecast window"
-            aviso_off_ref.missing_value = _FILL_INT
+            if "n_ref" not in ds.dimensions:
+                ds.createDimension("n_ref", n_ref)
+            if "ref_forecast_start" not in ds.variables:
+                fs_ref = ds.createVariable("ref_forecast_start", "S1", ("n_ref", "forecast_strlen"))
+                fs_ref.long_name = "forecast start REF (YYYY-MM-DD)"
+            else:
+                fs_ref = ds.variables["ref_forecast_start"]
+            if "ref_divergence_days" not in ds.variables:
+                div_ref = ds.createVariable("ref_divergence_days", "i4", "n_ref")
+                div_ref.long_name = "divergence (days): REF first LCE day − AVISO first LCE day"
+            else:
+                div_ref = ds.variables["ref_divergence_days"]
+            if "ref_aviso_offset_days" not in ds.variables:
+                aviso_off_ref = ds.createVariable("ref_aviso_offset_days", "i4", "n_ref")
+                aviso_off_ref.long_name = "AVISO first LCE lead day within this forecast window"
+                aviso_off_ref.missing_value = _FILL_INT
+            else:
+                aviso_off_ref = ds.variables["ref_aviso_offset_days"]
             for i, entry in enumerate(timing_ref):
                 fs_dt, d = entry[0], entry[1]
                 aviso_off = entry[2] if len(entry) > 2 else None
@@ -2485,14 +2493,24 @@ def save_lce_timing_to_netcdf(
                 div_ref[i] = int(d)
                 aviso_off_ref[i] = int(aviso_off) if aviso_off is not None else _FILL_INT
         if n_gl > 0:
-            ds.createDimension("n_gliders", n_gl)
-            fs_gl = ds.createVariable("gliders_forecast_start", "S1", ("n_gliders", "forecast_strlen"))
-            fs_gl.long_name = "forecast start GLIDERS (YYYY-MM-DD)"
-            div_gl = ds.createVariable("gliders_divergence_days", "i4", "n_gliders")
-            div_gl.long_name = "divergence (days): GLIDERS first LCE day − AVISO first LCE day"
-            aviso_off_gl = ds.createVariable("gliders_aviso_offset_days", "i4", "n_gliders")
-            aviso_off_gl.long_name = "AVISO first LCE lead day within this forecast window"
-            aviso_off_gl.missing_value = _FILL_INT
+            if "n_gliders" not in ds.dimensions:
+                ds.createDimension("n_gliders", n_gl)
+            if "gliders_forecast_start" not in ds.variables:
+                fs_gl = ds.createVariable("gliders_forecast_start", "S1", ("n_gliders", "forecast_strlen"))
+                fs_gl.long_name = "forecast start GLIDERS (YYYY-MM-DD)"
+            else:
+                fs_gl = ds.variables["gliders_forecast_start"]
+            if "gliders_divergence_days" not in ds.variables:
+                div_gl = ds.createVariable("gliders_divergence_days", "i4", "n_gliders")
+                div_gl.long_name = "divergence (days): GLIDERS first LCE day − AVISO first LCE day"
+            else:
+                div_gl = ds.variables["gliders_divergence_days"]
+            if "gliders_aviso_offset_days" not in ds.variables:
+                aviso_off_gl = ds.createVariable("gliders_aviso_offset_days", "i4", "n_gliders")
+                aviso_off_gl.long_name = "AVISO first LCE lead day within this forecast window"
+                aviso_off_gl.missing_value = _FILL_INT
+            else:
+                aviso_off_gl = ds.variables["gliders_aviso_offset_days"]
             for i, entry in enumerate(timing_gliders):
                 fs_dt, d = entry[0], entry[1]
                 aviso_off = entry[2] if len(entry) > 2 else None
