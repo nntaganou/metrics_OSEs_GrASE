@@ -3823,72 +3823,160 @@ if __name__ == "__main__":
         if forecast_start_dt:
             print(f"  Forecast start: {forecast_start_dt.strftime('%Y-%m-%d')}")
 
-        # Process timing distribution if requested
-        if args.timing_distribution and forecast_start_dt:
-            print(f"[Timing distribution] Processing NetCDF files with 0.5° + LCE detection...")
+        # ---------------------------------------------------------------------
+        # Timing distribution / detachment count / separation timing (light path)
+        # Mirrors the --hycom light path (lines ~3228-3398) but for a single
+        # NetCDF forecast directory (one forecast window) instead of many
+        # auto-discovered HYCOM forecasts.
+        # ---------------------------------------------------------------------
+        need_timing_light = args.timing_distribution or args.detachment_count or args.separation_timing
+        if need_timing_light and forecast_start_dt:
+            print(f"[Timing/detachment/separation] Processing NetCDF files with 0.5° + LCE detection...")
             timing_only_data_ref = []
             timing_only_data_gliders = []
+            detachment_count_data_ref = []
+            detachment_count_data_gliders = []
+            aviso_date_max_lat: Dict[datetime, float] = {}
+            sep_series_ref: List[Tuple[datetime, List[Tuple[datetime, float]], Dict[datetime, bool]]] = []
+            sep_series_gliders: List[Tuple[datetime, List[Tuple[datetime, float]], Dict[datetime, bool]]] = []
 
-            def _build_timing_series(nc_pairs):
+            def _process_netcdf_group(nc_pairs):
+                """Same per-file extraction as the --hycom light-path loop, applied to a
+                (nc_file, date_str) list from one experiment (REF or GLIDERS)."""
                 series_model, series_aviso = [], []
                 lce_by_lead: Dict[int, bool] = {}
+                lce_by_lead_det: Dict[int, bool] = {}
+                sep_model_this: List[Tuple[datetime, float]] = []
+                sep_lce_this: Dict[datetime, bool] = {}
                 for nc_file, date_str in nc_pairs:
                     out = process_netcdf_file_for_timing_only(
                         nc_file, args.aviso_dir, args.mdt, forecast_start_dt,
                         lon_var=args.lon_var, lat_var=args.lat_var, ssh_var=args.ssh_var,
                         ssh_scale=args.ssh_scale, lon_cutoff=lon_cutoff,
                         lce_min_lon_span=lce_min_lon_span,
+                        sep_min_lon=-91.5 if args.separation_timing else None,
+                        det_min_lon=-91.5 if args.detachment_count else None,
                     )
                     if out is None:
                         continue
-                    lead, max_m, max_a, has_lce_timing, _has_lce_sep, _has_lce_det = out
+                    lead, max_m, max_a, has_lce_timing, has_lce_sep, has_lce_det = out
                     if max_m is not None:
                         series_model.append((lead, max_m))
                         lce_by_lead[lead] = has_lce_timing
+                        lce_by_lead_det[lead] = has_lce_det
                     if max_a is not None:
                         series_aviso.append((lead, max_a))
+                    if args.separation_timing or args.detachment_count:
+                        actual_date = forecast_start_dt + timedelta(days=lead)
+                        if args.separation_timing and max_m is not None:
+                            sep_model_this.append((actual_date, max_m))
+                            sep_lce_this[actual_date] = has_lce_sep
+                        if max_a is not None and actual_date not in aviso_date_max_lat:
+                            aviso_date_max_lat[actual_date] = max_a
                 series_model.sort(key=lambda x: x[0])
                 series_aviso.sort(key=lambda x: x[0])
-                return series_model, series_aviso, lce_by_lead
+                return series_model, series_aviso, lce_by_lead, lce_by_lead_det, sep_model_this, sep_lce_this
 
             # REF
-            series_ref_model, series_ref_aviso, lce_ref_by_lead = _build_timing_series(ref_files)
-            d_ref = compute_divergence_from_series(series_ref_model, series_ref_aviso, lead_has_lce_model=lce_ref_by_lead)
-            if d_ref is not None:
-                aviso_offset_ref = first_detachment_day_from_max_lat_series(series_ref_aviso)
-                timing_only_data_ref.append((forecast_start_dt, d_ref, aviso_offset_ref))
-                print(f"  REF: divergence={d_ref}d, aviso_offset={aviso_offset_ref}d")
+            (series_ref_model, series_ref_aviso, lce_ref_by_lead, lce_ref_by_lead_det,
+             sep_ref_model_this, sep_ref_lce_this) = _process_netcdf_group(ref_files)
+            if args.timing_distribution:
+                d_ref = compute_divergence_from_series(series_ref_model, series_ref_aviso, lead_has_lce_model=lce_ref_by_lead)
+                if d_ref is not None:
+                    aviso_offset_ref = first_detachment_day_from_max_lat_series(series_ref_aviso)
+                    timing_only_data_ref.append((forecast_start_dt, d_ref, aviso_offset_ref))
+                    print(f"  REF: divergence={d_ref}d, aviso_offset={aviso_offset_ref}d")
+            if args.detachment_count:
+                detachment_count_data_ref.append((
+                    forecast_start_dt,
+                    count_detachments_from_max_lat_series(series_ref_model, lead_has_lce=lce_ref_by_lead_det),
+                    count_detachments_from_max_lat_series(series_ref_aviso),
+                ))
+            if args.separation_timing and sep_ref_model_this:
+                sep_series_ref.append((forecast_start_dt, sep_ref_model_this, sep_ref_lce_this))
 
             # GLIDERS (if provided)
             if gliders_files:
-                series_gl_model, series_gl_aviso, lce_gl_by_lead = _build_timing_series(gliders_files)
-                d_gl = compute_divergence_from_series(series_gl_model, series_gl_aviso, lead_has_lce_model=lce_gl_by_lead)
-                if d_gl is not None:
-                    aviso_offset_gl = first_detachment_day_from_max_lat_series(series_gl_aviso)
-                    timing_only_data_gliders.append((forecast_start_dt, d_gl, aviso_offset_gl))
-                    print(f"  GLIDERS: divergence={d_gl}d, aviso_offset={aviso_offset_gl}d")
+                (series_gl_model, series_gl_aviso, lce_gl_by_lead, lce_gl_by_lead_det,
+                 sep_gl_model_this, sep_gl_lce_this) = _process_netcdf_group(gliders_files)
+                if args.timing_distribution:
+                    d_gl = compute_divergence_from_series(series_gl_model, series_gl_aviso, lead_has_lce_model=lce_gl_by_lead)
+                    if d_gl is not None:
+                        aviso_offset_gl = first_detachment_day_from_max_lat_series(series_gl_aviso)
+                        timing_only_data_gliders.append((forecast_start_dt, d_gl, aviso_offset_gl))
+                        print(f"  GLIDERS: divergence={d_gl}d, aviso_offset={aviso_offset_gl}d")
+                if args.detachment_count:
+                    detachment_count_data_gliders.append((
+                        forecast_start_dt,
+                        count_detachments_from_max_lat_series(series_gl_model, lead_has_lce=lce_gl_by_lead_det),
+                        count_detachments_from_max_lat_series(series_gl_aviso),
+                    ))
+                if args.separation_timing and sep_gl_model_this:
+                    sep_series_gliders.append((forecast_start_dt, sep_gl_model_this, sep_gl_lce_this))
 
-            # Plot + save
-            if timing_only_data_ref or timing_only_data_gliders:
-                plot_timing_distribution(
-                    timing_only_data_ref,
-                    timing_only_data_gliders,
-                    OUTPUT_DIR,
-                    ref_label=ref_label,
-                    gliders_label=gliders_label,
-                )
-                save_lce_timing_to_netcdf(
-                    timing_only_data_ref,
-                    timing_only_data_gliders,
-                    OUTPUT_DIR,
-                    filename="lce_timing_OSEs.nc"
-                )
-                print(f"  Saved: histogram_first_lce_divergence_aviso.png, lce_timing_OSEs.nc")
-            else:
-                print("  No divergence computed (model or AVISO had no detectable first detachment).")
+            # timing-distribution and detachment-count are only *computed* here;
+            # like --hycom, their plot_*/save_*_to_netcdf calls happen once in the
+            # shared end-of-script sections (using timing_only_data_ref/gliders and
+            # detachment_count_data_ref/gliders, which are now populated above).
+            if args.timing_distribution and not (timing_only_data_ref or timing_only_data_gliders):
+                print("  [Timing distribution] No divergence computed (model or AVISO had no detectable first detachment).")
+
+            aviso_total_detachments: Optional[int] = None
+            if args.separation_timing or args.detachment_count:
+                if aviso_date_max_lat:
+                    aviso_det_by_ord = [(d.toordinal(), lat) for d, lat in sorted(aviso_date_max_lat.items())]
+                    aviso_total_detachments = count_detachments_from_max_lat_series(aviso_det_by_ord)
+                    aviso_total_detachments_from_nc = aviso_total_detachments
+
+            # --- separation timing: plot + save ---
+            no_sep_ref: List[datetime] = []
+            no_sep_gl: List[datetime] = []
+            if args.separation_timing:
+                aviso_series = sorted(aviso_date_max_lat.items())
+                aviso_sep_date, aviso_confirmed = detect_final_separation(aviso_series)
+                if aviso_sep_date is None or not aviso_confirmed:
+                    print("  [Separation timing] Could not confirm final LC separation in AVISO. Skip histogram.")
+                else:
+                    print(f"  [Separation timing] AVISO final separation: {aviso_sep_date.strftime('%Y-%m-%d')}")
+
+                    def _compute_sep_divergences(sep_series_model, label):
+                        confirmed_items = []  # (divergence_days, forecast_start_date)
+                        uncertain_items = []
+                        no_sep_forecasts = []  # forecast_start_date with no separation detected
+                        for fs_dt_i, date_ml, lce_dict in sep_series_model:
+                            sep_date, is_confirmed = detect_final_separation(date_ml, date_has_lce=lce_dict)
+                            if sep_date is not None:
+                                div = (sep_date - aviso_sep_date).days
+                                if is_confirmed:
+                                    confirmed_items.append((div, fs_dt_i))
+                                else:
+                                    uncertain_items.append((div, fs_dt_i))
+                            else:
+                                no_sep_forecasts.append(fs_dt_i)
+                        all_items = sorted(confirmed_items + uncertain_items, key=lambda x: x[0])
+                        for div, fs_dt_i in all_items:
+                            tag = "confirmed" if (div, fs_dt_i) in confirmed_items else "uncertain"
+                            print(f"    [{label}] {tag} separation: forecast {fs_dt_i.strftime('%Y-%m-%d')} (divergence {div:+d} days)")
+                        if not all_items:
+                            print(f"    [{label}] No separations detected.")
+                        return confirmed_items, uncertain_items, no_sep_forecasts
+
+                    conf_ref, unc_ref, no_sep_ref = _compute_sep_divergences(sep_series_ref, ref_label)
+                    conf_gl, unc_gl, no_sep_gl = _compute_sep_divergences(sep_series_gliders, gliders_label)
+                    plot_separation_timing(
+                        conf_ref, unc_ref, conf_gl, unc_gl, OUTPUT_DIR,
+                        ref_label=ref_label, gliders_label=gliders_label, aviso_sep_date=aviso_sep_date,
+                    )
+                    save_separation_timing_to_netcdf(aviso_sep_date, conf_ref, unc_ref, conf_gl, unc_gl, OUTPUT_DIR)
+                    print(f"  Saved: histogram_final_separation_timing.png, lce_timing_OSEs.nc")
+                    save_forecast_summary_table(
+                        OUTPUT_DIR, ref_label, gliders_label,
+                        detachment_count_data_ref, detachment_count_data_gliders,
+                        aviso_total_detachments, no_sep_ref, no_sep_gl,
+                    )
         else:
-            if args.timing_distribution and not forecast_start_dt:
-                print("Skipping timing-distribution: forecast start date required (set --forecast-start or provide folder name)")
+            if need_timing_light and not forecast_start_dt:
+                print("Skipping timing-distribution/detachment-count/separation-timing: forecast start date required (set --forecast-start or provide folder name)")
 
 
     elif args.multi_simulation:
