@@ -1236,6 +1236,63 @@ def process_hycom_file_for_timing_only(
         return None
 
 
+def process_netcdf_file_for_timing_only(
+    nc_path: str,
+    aviso_dir: str,
+    mdt_path: str,
+    forecast_start: datetime,
+    lon_var: str = "longitude",
+    lat_var: str = "latitude",
+    ssh_var: str = "ssh",
+    ssh_scale: float = 1.0,
+    lon_cutoff: float = -81.0,
+    lce_min_lon_span: float = 1.3,
+    sep_min_lon: Optional[float] = None,
+    det_min_lon: Optional[float] = None,
+) -> Optional[Tuple]:
+    """
+    Lightweight NetCDF equivalent of process_hycom_file_for_timing_only: load LC contours
+    (+ optionally LCE flags for timing/separation/detachment), no MHD.
+    Returns (lead, max_lat_model, max_lat_aviso, has_lce_timing, has_lce_sep, has_lce_det)
+    or None if date/contours invalid.
+    """
+    date = extract_date_from_netcdf_path(nc_path)
+    if date is None:
+        return None
+    date_obj = datetime.strptime(date, "%Y%m%d")
+    lead = (date_obj - forecast_start).days
+    if lead < 0 or lead > MAX_LEAD_DAYS:
+        return None
+    try:
+        lon_model, lat_model, ssh_model = load_ssh_from_netcdf(
+            nc_path, lon_var=lon_var, lat_var=lat_var, ssh_var=ssh_var, ssh_scale=ssh_scale,
+        )
+        ssh_demeaned = demean_region(ssh_model, lon_model, lat_model, DEMEAN_BBOX)
+        contour_model = get_model_contour_from_ssh(lon_model, lat_model, ssh_demeaned, demean=False)
+        contour_aviso = get_aviso_contours_only(date, aviso_dir=aviso_dir, mdt_path=mdt_path)
+
+        contour_model = filter_contour_from_latitude(contour_model, 21.0) if contour_model is not None else None
+        contour_aviso = filter_contour_from_latitude(contour_aviso, 21.0) if contour_aviso is not None else None
+        contour_model, contour_aviso = clip_contours_to_longitude_cutoff(
+            contour_model, contour_aviso, lon_cutoff=lon_cutoff
+        )
+        max_lat_model = float(np.max(contour_model[:, 1])) if contour_model is not None and len(contour_model) > 0 else None
+        max_lat_aviso = float(np.max(contour_aviso[:, 1])) if contour_aviso is not None and len(contour_aviso) > 0 else None
+        if max_lat_model is None and max_lat_aviso is None:
+            return None
+
+        _base = dict(level_min=0.17, level_max=0.17, num_levels=1, min_lon_span=lce_min_lon_span)
+        lce_timing_flag = len(find_lce_region_contours(lon_model, lat_model, ssh_demeaned, **_base, min_lon=-90.0)) > 0
+        lce_sep_flag = len(find_lce_region_contours(lon_model, lat_model, ssh_demeaned, **_base, min_lon=sep_min_lon)) > 0 if sep_min_lon is not None else False
+        lce_det_flag = (
+            len(find_lce_region_contours(lon_model, lat_model, ssh_demeaned, **_base, min_lon=det_min_lon)) > 0
+            if det_min_lon is not None else lce_timing_flag
+        )
+        return (lead, max_lat_model, max_lat_aviso, lce_timing_flag, lce_sep_flag, lce_det_flag)
+    except Exception:
+        return None
+
+
 def compute_divergence_from_series(
     series_model: List[Tuple[int, float]],
     series_aviso: List[Tuple[int, float]],
@@ -3707,6 +3764,131 @@ if __name__ == "__main__":
                     if not need_animation:
                         results_ref = results_ref_all
                         results_gliders = results_gliders_all
+
+
+    elif args.no_hycom:
+        # ---------------------------------------------------------------------
+        # Single NetCDF directory (--no-hycom): REF and optional GLIDERS
+        # Supports timing-distribution with 0.5° + LCE detection
+        # ---------------------------------------------------------------------
+        if not args.netcdf_dir or not args.aviso_dir or not args.mdt:
+            parser.error("--no-hycom requires --netcdf-dir, --aviso-dir, and --mdt")
+
+        results_ref = []
+        results_gliders = []
+        need_full_processing = args.timeseries or args.timeseries_by_date or args.mean_std or args.mean_std_by_date
+        ref_label = args.model_label
+        gliders_label = args.model_label_gliders
+
+        # Parse fallback forecast start
+        fallback_fs = None
+        if args.forecast_start:
+            try:
+                fallback_fs = datetime.strptime(args.forecast_start, "%Y-%m-%d")
+            except ValueError:
+                print(f"Warning: --forecast-start {args.forecast_start} invalid (use YYYY-MM-DD). Ignoring fallback.")
+
+        # Collect NetCDF files
+        def collect_netcdf_files(nc_dir):
+            """Collect and sort NetCDF files by date extracted from filename."""
+            pattern = os.path.join(nc_dir, args.netcdf_pattern)
+            nc_files = sorted(glob.glob(pattern))
+            nc_files = [f for f in nc_files if os.path.isfile(f) and f.endswith(".nc")]
+            nc_files = [f for f in nc_files if not os.path.basename(f).startswith("mhd_OSEs") and not os.path.basename(f).startswith("lce_timing")]
+            pairs = []
+            for f in nc_files:
+                date_str = extract_date_from_netcdf_path(f)
+                if date_str:
+                    pairs.append((f, date_str))
+            return sorted(pairs, key=lambda x: x[1])
+
+        # Infer forecast start from directory name or use fallback
+        forecast_start_dt = None
+        ref_files = collect_netcdf_files(args.netcdf_dir)
+        if ref_files:
+            forecast_start_dt = infer_forecast_start_from_path(ref_files[0][0])
+        if forecast_start_dt is None:
+            forecast_start_dt = fallback_fs
+
+        if forecast_start_dt is None and (args.timing_distribution or args.detachment_count or args.separation_timing):
+            print(f"Warning: Could not infer forecast start date. Timing-distribution/detachment-count/separation-timing may fail.")
+            print(f"  Tried: folder name inference, fallback --forecast-start")
+            print(f"  Provide --forecast-start YYYY-MM-DD to enable timing analysis")
+
+        gliders_files = []
+        if args.netcdf_dir_gliders:
+            gliders_files = collect_netcdf_files(args.netcdf_dir_gliders)
+
+        print(f"[--no-hycom] REF: {len(ref_files)} files, GLIDERS: {len(gliders_files)} files")
+        if forecast_start_dt:
+            print(f"  Forecast start: {forecast_start_dt.strftime('%Y-%m-%d')}")
+
+        # Process timing distribution if requested
+        if args.timing_distribution and forecast_start_dt:
+            print(f"[Timing distribution] Processing NetCDF files with 0.5° + LCE detection...")
+            timing_only_data_ref = []
+            timing_only_data_gliders = []
+
+            def _build_timing_series(nc_pairs):
+                series_model, series_aviso = [], []
+                lce_by_lead: Dict[int, bool] = {}
+                for nc_file, date_str in nc_pairs:
+                    out = process_netcdf_file_for_timing_only(
+                        nc_file, args.aviso_dir, args.mdt, forecast_start_dt,
+                        lon_var=args.lon_var, lat_var=args.lat_var, ssh_var=args.ssh_var,
+                        ssh_scale=args.ssh_scale, lon_cutoff=lon_cutoff,
+                        lce_min_lon_span=lce_min_lon_span,
+                    )
+                    if out is None:
+                        continue
+                    lead, max_m, max_a, has_lce_timing, _has_lce_sep, _has_lce_det = out
+                    if max_m is not None:
+                        series_model.append((lead, max_m))
+                        lce_by_lead[lead] = has_lce_timing
+                    if max_a is not None:
+                        series_aviso.append((lead, max_a))
+                series_model.sort(key=lambda x: x[0])
+                series_aviso.sort(key=lambda x: x[0])
+                return series_model, series_aviso, lce_by_lead
+
+            # REF
+            series_ref_model, series_ref_aviso, lce_ref_by_lead = _build_timing_series(ref_files)
+            d_ref = compute_divergence_from_series(series_ref_model, series_ref_aviso, lead_has_lce_model=lce_ref_by_lead)
+            if d_ref is not None:
+                aviso_offset_ref = first_detachment_day_from_max_lat_series(series_ref_aviso)
+                timing_only_data_ref.append((forecast_start_dt, d_ref, aviso_offset_ref))
+                print(f"  REF: divergence={d_ref}d, aviso_offset={aviso_offset_ref}d")
+
+            # GLIDERS (if provided)
+            if gliders_files:
+                series_gl_model, series_gl_aviso, lce_gl_by_lead = _build_timing_series(gliders_files)
+                d_gl = compute_divergence_from_series(series_gl_model, series_gl_aviso, lead_has_lce_model=lce_gl_by_lead)
+                if d_gl is not None:
+                    aviso_offset_gl = first_detachment_day_from_max_lat_series(series_gl_aviso)
+                    timing_only_data_gliders.append((forecast_start_dt, d_gl, aviso_offset_gl))
+                    print(f"  GLIDERS: divergence={d_gl}d, aviso_offset={aviso_offset_gl}d")
+
+            # Plot + save
+            if timing_only_data_ref or timing_only_data_gliders:
+                plot_timing_distribution(
+                    timing_only_data_ref,
+                    timing_only_data_gliders,
+                    OUTPUT_DIR,
+                    ref_label=ref_label,
+                    gliders_label=gliders_label,
+                )
+                save_lce_timing_to_netcdf(
+                    timing_only_data_ref,
+                    timing_only_data_gliders,
+                    OUTPUT_DIR,
+                    filename="lce_timing_OSEs.nc"
+                )
+                print(f"  Saved: histogram_first_lce_divergence_aviso.png, lce_timing_OSEs.nc")
+            else:
+                print("  No divergence computed (model or AVISO had no detectable first detachment).")
+        else:
+            if args.timing_distribution and not forecast_start_dt:
+                print("Skipping timing-distribution: forecast start date required (set --forecast-start or provide folder name)")
 
 
     elif args.multi_simulation:
