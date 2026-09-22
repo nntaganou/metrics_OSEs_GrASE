@@ -4371,7 +4371,10 @@ if __name__ == "__main__":
                             for div, fs_dt_i in all_items:
                                 tag = "confirmed" if (div, fs_dt_i) in confirmed_items else "uncertain"
                                 print(f"    [{label}] {tag} separation: forecast {fs_dt_i.strftime('%Y-%m-%d')} (divergence {div:+d} days)")
-                            if not all_items:
+                            if all_items:
+                                all_divs = [d for d, _ in all_items]
+                                print(f"    [{label}] {len(confirmed_items)} confirmed, {len(uncertain_items)} uncertain; mean divergence: {np.mean(all_divs):.1f} days, std: {np.std(all_divs):.1f} days")
+                            else:
                                 print(f"    [{label}] No separations detected.")
                             return confirmed_items, uncertain_items, no_sep_forecasts
 
