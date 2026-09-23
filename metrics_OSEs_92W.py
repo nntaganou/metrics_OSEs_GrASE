@@ -1337,12 +1337,15 @@ def process_netcdf_file_for_timing_only(
             return None
 
         _base = dict(level_min=0.17, level_max=0.17, num_levels=1, min_lon_span=lce_min_lon_span)
-        lce_timing_flag = len(find_lce_region_contours(lon_model, lat_model, ssh_demeaned, **_base, min_lon=-90.0)) > 0
-        lce_sep_flag = len(find_lce_region_contours(lon_model, lat_model, ssh_demeaned, **_base, min_lon=sep_min_lon)) > 0 if sep_min_lon is not None else False
-        lce_det_flag = (
-            len(find_lce_region_contours(lon_model, lat_model, ssh_demeaned, **_base, min_lon=det_min_lon)) > 0
-            if det_min_lon is not None else lce_timing_flag
-        )
+        try:
+            lce_timing_flag = len(find_lce_region_contours(lon_model, lat_model, ssh_demeaned, **_base, min_lon=-90.0)) > 0
+            lce_sep_flag = len(find_lce_region_contours(lon_model, lat_model, ssh_demeaned, **_base, min_lon=sep_min_lon)) > 0 if sep_min_lon is not None else False
+            lce_det_flag = (
+                len(find_lce_region_contours(lon_model, lat_model, ssh_demeaned, **_base, min_lon=det_min_lon)) > 0
+                if det_min_lon is not None else lce_timing_flag
+            )
+        except Exception:
+            lce_timing_flag = lce_sep_flag = lce_det_flag = False
 
         lce_aviso_timing_flag = lce_aviso_sep_flag = lce_aviso_det_flag = False
         if aviso_raw is not None:
@@ -3675,7 +3678,8 @@ if __name__ == "__main__":
                                 _aviso_tot_fp: Optional[int] = None
                                 if aviso_date_max_lat:
                                     _aviso_det_ord_fp = [(d.toordinal(), lat) for d, lat in sorted(aviso_date_max_lat.items())]
-                                    _aviso_tot_fp = count_detachments_from_max_lat_series(_aviso_det_ord_fp)
+                                    _aviso_lce_det_ord_fp = {d.toordinal(): v for d, v in aviso_date_has_lce_det.items()}
+                                    _aviso_tot_fp = count_detachments_from_max_lat_series(_aviso_det_ord_fp, lead_has_lce=_aviso_lce_det_ord_fp)
                                 save_forecast_summary_table(
                                     OUTPUT_DIR, ref_label, gliders_label,
                                     detachment_count_data_ref or [],
@@ -3884,7 +3888,8 @@ if __name__ == "__main__":
                                 _aviso_tot2: Optional[int] = None
                                 if aviso_date_max_lat:
                                     _aviso_det_ord2 = [(d.toordinal(), lat) for d, lat in sorted(aviso_date_max_lat.items())]
-                                    _aviso_tot2 = count_detachments_from_max_lat_series(_aviso_det_ord2)
+                                    _aviso_lce_det_ord2 = {d.toordinal(): v for d, v in aviso_date_has_lce_det.items()}
+                                    _aviso_tot2 = count_detachments_from_max_lat_series(_aviso_det_ord2, lead_has_lce=_aviso_lce_det_ord2)
                                 save_forecast_summary_table(
                                     OUTPUT_DIR, ref_label, gliders_label,
                                     detachment_count_data_ref or [],
