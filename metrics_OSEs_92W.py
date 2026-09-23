@@ -36,6 +36,7 @@ from loop_current_contour import (
     all_contours_17cm,
     has_lce_17cm,
     get_aviso_contours_only,
+    get_aviso_contour_from_ssh,
     get_model_contour_from_ssh,
     load_aviso_sla_plus_mdt_on_aviso_grid,
 )
@@ -83,6 +84,10 @@ HYCOM_GRID_FILE = None  # e.g. "/path/to/regional.grid.a"
 # Drop in LC northernmost latitude (degrees) for first-LCE detachment detection.
 LC_NORTH_DROP_DEGREES = 2.0
 MAX_LEAD_DAYS = 90
+# AVISO dates after this are excluded from detachment-count / separation-timing
+# (aviso_date_max_lat and its LCE dicts). Does not affect timing-distribution's
+# per-forecast AVISO series, only the merged full-series AVISO detection.
+AVISO_DETACHMENT_SEPARATION_CUTOFF = datetime(2025, 9, 30)
 # MHD: only contour points east of this longitude. LCEs included only if all their points are east of it.
 # Swap the next two lines to switch between 90W (standard) and 92W (test: extend domain west).
 MHD_LON_MIN = -92.0   # 92W for test
@@ -1203,12 +1208,25 @@ def process_hycom_file_for_timing_only(
     if lead < 0 or lead > MAX_LEAD_DAYS:
         return None
     try:
+        # Load AVISO SSH once (if needed) and reuse it for both the contour (via
+        # get_hycom_aviso_contours' aviso_data param, skipping its internal reload)
+        # and the LCE detection below — avoids loading+parsing the same AVISO file twice.
+        aviso_raw: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None
+        if load_aviso:
+            try:
+                aviso_pattern = os.path.join(aviso_dir, f"*{date}*.nc")
+                aviso_files = sorted(glob.glob(aviso_pattern))
+                if aviso_files:
+                    aviso_raw = load_aviso_sla_plus_mdt_on_aviso_grid(aviso_files[0], mdt_path)
+            except Exception:
+                aviso_raw = None
         contour_hycom, contour_aviso = get_hycom_aviso_contours(
             hycom_archv_file=hycom_file,
             hycom_grid_file=grid_file,
             date=date,
             aviso_dir=aviso_dir,
             mdt_path=mdt_path,
+            aviso_data=aviso_raw,
             load_aviso=load_aviso,
         )
         contour_hycom = filter_contour_from_latitude(contour_hycom, 21.0) if contour_hycom is not None else None
@@ -1235,20 +1253,17 @@ def process_hycom_file_for_timing_only(
             except Exception:
                 lce_timing_flag = lce_sep_flag = lce_det_flag = False
             lce_aviso_timing_flag = lce_aviso_sep_flag = lce_aviso_det_flag = False
-            if load_aviso:
+            if aviso_raw is not None:
                 try:
-                    aviso_pattern = os.path.join(aviso_dir, f"*{date}*.nc")
-                    aviso_files = sorted(glob.glob(aviso_pattern))
-                    if aviso_files:
-                        lon_av, lat_av, ssh_av = load_aviso_sla_plus_mdt_on_aviso_grid(aviso_files[0], mdt_path)
-                        ssh_av = demean_region(ssh_av, lon_av, lat_av, DEMEAN_BBOX)
-                        lce_aviso_timing_flag = len(find_lce_region_contours(lon_av, lat_av, ssh_av, **_base)) > 0
-                        _sep_contours_av = find_lce_region_contours(lon_av, lat_av, ssh_av, **_base, min_lon=sep_min_lon) if sep_min_lon is not None else []
-                        lce_aviso_sep_flag = len(_sep_contours_av) > 0
-                        lce_aviso_det_flag = (
-                            len(find_lce_region_contours(lon_av, lat_av, ssh_av, **_base, min_lon=det_min_lon)) > 0
-                            if det_min_lon is not None else lce_aviso_timing_flag
-                        )
+                    lon_av, lat_av, ssh_av = aviso_raw
+                    ssh_av = demean_region(ssh_av, lon_av, lat_av, DEMEAN_BBOX)
+                    lce_aviso_timing_flag = len(find_lce_region_contours(lon_av, lat_av, ssh_av, **_base)) > 0
+                    _sep_contours_av = find_lce_region_contours(lon_av, lat_av, ssh_av, **_base, min_lon=sep_min_lon) if sep_min_lon is not None else []
+                    lce_aviso_sep_flag = len(_sep_contours_av) > 0
+                    lce_aviso_det_flag = (
+                        len(find_lce_region_contours(lon_av, lat_av, ssh_av, **_base, min_lon=det_min_lon)) > 0
+                        if det_min_lon is not None else lce_aviso_timing_flag
+                    )
                 except Exception:
                     lce_aviso_timing_flag = lce_aviso_sep_flag = lce_aviso_det_flag = False
             return (
@@ -1295,7 +1310,21 @@ def process_netcdf_file_for_timing_only(
         )
         ssh_demeaned = demean_region(ssh_model, lon_model, lat_model, DEMEAN_BBOX)
         contour_model = get_model_contour_from_ssh(lon_model, lat_model, ssh_demeaned, demean=False)
-        contour_aviso = get_aviso_contours_only(date, aviso_dir=aviso_dir, mdt_path=mdt_path)
+
+        # Load AVISO SSH once and reuse it for both the contour (below) and the LCE
+        # detection (further down) — avoids loading+parsing the same AVISO file twice.
+        aviso_raw: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None
+        aviso_pattern = os.path.join(aviso_dir, f"*{date}*.nc")
+        aviso_files = sorted(glob.glob(aviso_pattern))
+        if aviso_files:
+            aviso_raw = load_aviso_sla_plus_mdt_on_aviso_grid(aviso_files[0], mdt_path)
+        contour_aviso = None
+        if aviso_raw is not None:
+            lon_av0, lat_av0, ssh_av0 = aviso_raw
+            lon_min, lat_min, lon_max, lat_max = GOM_BBOX_FOR_CONTOURS
+            mask = (lon_av0 >= lon_min) & (lon_av0 <= lon_max) & (lat_av0 >= lat_min) & (lat_av0 <= lat_max)
+            ssh_gom = np.where(mask, ssh_av0, np.nan)
+            contour_aviso = get_aviso_contour_from_ssh(lon_av0, lat_av0, ssh_gom, level_cm=17.0)
 
         contour_model = filter_contour_from_latitude(contour_model, 21.0) if contour_model is not None else None
         contour_aviso = filter_contour_from_latitude(contour_aviso, 21.0) if contour_aviso is not None else None
@@ -1316,11 +1345,9 @@ def process_netcdf_file_for_timing_only(
         )
 
         lce_aviso_timing_flag = lce_aviso_sep_flag = lce_aviso_det_flag = False
-        try:
-            aviso_pattern = os.path.join(aviso_dir, f"*{date}*.nc")
-            aviso_files = sorted(glob.glob(aviso_pattern))
-            if aviso_files:
-                lon_av, lat_av, ssh_av = load_aviso_sla_plus_mdt_on_aviso_grid(aviso_files[0], mdt_path)
+        if aviso_raw is not None:
+            try:
+                lon_av, lat_av, ssh_av = aviso_raw
                 ssh_av = demean_region(ssh_av, lon_av, lat_av, DEMEAN_BBOX)
                 lce_aviso_timing_flag = len(find_lce_region_contours(lon_av, lat_av, ssh_av, **_base, min_lon=-90.0)) > 0
                 lce_aviso_sep_flag = len(find_lce_region_contours(lon_av, lat_av, ssh_av, **_base, min_lon=sep_min_lon)) > 0 if sep_min_lon is not None else False
@@ -1328,8 +1355,8 @@ def process_netcdf_file_for_timing_only(
                     len(find_lce_region_contours(lon_av, lat_av, ssh_av, **_base, min_lon=det_min_lon)) > 0
                     if det_min_lon is not None else lce_aviso_timing_flag
                 )
-        except Exception:
-            lce_aviso_timing_flag = lce_aviso_sep_flag = lce_aviso_det_flag = False
+            except Exception:
+                lce_aviso_timing_flag = lce_aviso_sep_flag = lce_aviso_det_flag = False
 
         return (
             lead, max_lat_model, max_lat_aviso,
@@ -3051,6 +3078,7 @@ if __name__ == "__main__":
     detachment_count_data_gliders = None
     aviso_date_max_lat: Optional[Dict[datetime, float]] = None
     aviso_date_has_lce_sep: Optional[Dict[datetime, bool]] = None
+    aviso_date_has_lce_det: Optional[Dict[datetime, bool]] = None
     aviso_total_detachments_from_nc: Optional[int] = None
     animate_all_done = False  # True when --animate-all produced one MP4 per forecast
 
@@ -3275,6 +3303,7 @@ if __name__ == "__main__":
                     if args.separation_timing or args.detachment_count:
                         aviso_date_max_lat = {}
                         aviso_date_has_lce_sep: Dict[datetime, bool] = {}
+                        aviso_date_has_lce_det: Dict[datetime, bool] = {}
                         sep_series_ref: List[Tuple[datetime, List[Tuple[datetime, float]], Dict[datetime, bool]]] = []
                         sep_series_gliders: List[Tuple[datetime, List[Tuple[datetime, float]], Dict[datetime, bool]]] = []
                 for cfg_idx, (files_ref, files_gliders, grid_ref, grid_gliders, aviso_dir, mdt_path, fs_dt) in (enumerate(configs) if need_loop else []):
@@ -3306,7 +3335,7 @@ if __name__ == "__main__":
                                     series_ref_model.append((lead, max_m))
                                     lce_ref_by_lead[lead] = has_lce_timing
                                     lce_ref_by_lead_det[lead] = has_lce_det
-                                if max_a is not None:
+                                if max_a is not None and fs_dt + timedelta(days=lead) <= AVISO_DETACHMENT_SEPARATION_CUTOFF:
                                     series_ref_aviso.append((lead, max_a))
                                     lce_aviso_ref_by_lead[lead] = has_lce_aviso_timing
                                     lce_aviso_ref_by_lead_det[lead] = has_lce_aviso_det
@@ -3316,9 +3345,10 @@ if __name__ == "__main__":
                                         if max_m is not None:
                                             sep_ref_model_this.append((actual_date, max_m))
                                             sep_ref_lce_this[actual_date] = has_lce_sep
-                                    if max_a is not None and actual_date not in aviso_date_max_lat:
+                                    if max_a is not None and actual_date <= AVISO_DETACHMENT_SEPARATION_CUTOFF and actual_date not in aviso_date_max_lat:
                                         aviso_date_max_lat[actual_date] = max_a
                                         aviso_date_has_lce_sep[actual_date] = has_lce_aviso_sep
+                                        aviso_date_has_lce_det[actual_date] = has_lce_aviso_det
                         if args.no_lce_timeseries or args.no_lce_timeseries_by_date or args.no_lce_mean_std or args.no_lce_mean_std_by_date:
                             r = process_hycom_file_for_lc_only_mhd(
                                 hycom_file, grid_ref, aviso_dir, mdt_path, fs_dt, lon_cutoff=lon_cutoff
@@ -3368,7 +3398,7 @@ if __name__ == "__main__":
                                     series_gliders_model.append((lead, max_m))
                                     lce_gliders_by_lead[lead] = has_lce_timing
                                     lce_gliders_by_lead_det[lead] = has_lce_det
-                                if max_a is not None:
+                                if max_a is not None and fs_dt + timedelta(days=lead) <= AVISO_DETACHMENT_SEPARATION_CUTOFF:
                                     series_gliders_aviso.append((lead, max_a))
                                     lce_aviso_gliders_by_lead[lead] = has_lce_aviso_timing
                                     lce_aviso_gliders_by_lead_det[lead] = has_lce_aviso_det
@@ -3378,9 +3408,10 @@ if __name__ == "__main__":
                                         if max_m is not None:
                                             sep_gliders_model_this.append((actual_date, max_m))
                                             sep_gliders_lce_this[actual_date] = has_lce_sep
-                                    if max_a is not None and actual_date not in aviso_date_max_lat:
+                                    if max_a is not None and actual_date <= AVISO_DETACHMENT_SEPARATION_CUTOFF and actual_date not in aviso_date_max_lat:
                                         aviso_date_max_lat[actual_date] = max_a
                                         aviso_date_has_lce_sep[actual_date] = has_lce_aviso_sep
+                                        aviso_date_has_lce_det[actual_date] = has_lce_aviso_det
                         if args.no_lce_timeseries or args.no_lce_timeseries_by_date or args.no_lce_mean_std or args.no_lce_mean_std_by_date:
                             r = process_hycom_file_for_lc_only_mhd(
                                 hycom_file, grid_gliders, aviso_dir, mdt_path, fs_dt, lon_cutoff=lon_cutoff
@@ -3454,7 +3485,8 @@ if __name__ == "__main__":
                         _aviso_tot_for_table: Optional[int] = None
                         if aviso_date_max_lat is not None and aviso_date_max_lat:
                             _aviso_det_ord = [(d.toordinal(), lat) for d, lat in sorted(aviso_date_max_lat.items())]
-                            _aviso_tot_for_table = count_detachments_from_max_lat_series(_aviso_det_ord)
+                            _aviso_lce_det_ord = {d.toordinal(): v for d, v in aviso_date_has_lce_det.items()}
+                            _aviso_tot_for_table = count_detachments_from_max_lat_series(_aviso_det_ord, lead_has_lce=_aviso_lce_det_ord)
                         save_forecast_summary_table(
                             OUTPUT_DIR, ref_label, gliders_label,
                             detachment_count_data_ref or [],
@@ -3486,6 +3518,7 @@ if __name__ == "__main__":
                         if args.separation_timing or args.detachment_count:
                             aviso_date_max_lat = {}
                             aviso_date_has_lce_sep: Dict[datetime, bool] = {}
+                            aviso_date_has_lce_det: Dict[datetime, bool] = {}
                         if args.separation_timing:
                             sep_series_ref_fp: List = []
                             sep_series_gliders_fp: List = []
@@ -3517,7 +3550,7 @@ if __name__ == "__main__":
                                         series_ref_model.append((lead, max_m))
                                         lce_ref_by_lead_fp[lead] = has_lce_timing
                                         lce_ref_by_lead_fp_det[lead] = has_lce_det
-                                    if max_a is not None:
+                                    if max_a is not None and fs_dt + timedelta(days=lead) <= AVISO_DETACHMENT_SEPARATION_CUTOFF:
                                         series_ref_aviso.append((lead, max_a))
                                         lce_aviso_ref_by_lead_fp[lead] = has_lce_aviso_timing
                                         lce_aviso_ref_by_lead_fp_det[lead] = has_lce_aviso_det
@@ -3527,9 +3560,10 @@ if __name__ == "__main__":
                                             if max_m is not None:
                                                 sep_ref_model_this_fp.append((actual_date, max_m))
                                                 sep_ref_lce_this_fp[actual_date] = has_lce_sep
-                                        if max_a is not None and actual_date not in aviso_date_max_lat:
+                                        if max_a is not None and actual_date <= AVISO_DETACHMENT_SEPARATION_CUTOFF and actual_date not in aviso_date_max_lat:
                                             aviso_date_max_lat[actual_date] = max_a
                                             aviso_date_has_lce_sep[actual_date] = has_lce_aviso_sep
+                                            aviso_date_has_lce_det[actual_date] = has_lce_aviso_det
                             series_ref_model.sort(key=lambda x: x[0])
                             series_ref_aviso.sort(key=lambda x: x[0])
                             if args.timing_distribution:
@@ -3572,7 +3606,7 @@ if __name__ == "__main__":
                                         series_gliders_model.append((lead, max_m))
                                         lce_gliders_by_lead_fp[lead] = has_lce_timing
                                         lce_gliders_by_lead_fp_det[lead] = has_lce_det
-                                    if max_a is not None:
+                                    if max_a is not None and fs_dt + timedelta(days=lead) <= AVISO_DETACHMENT_SEPARATION_CUTOFF:
                                         series_gliders_aviso.append((lead, max_a))
                                         lce_aviso_gliders_by_lead_fp[lead] = has_lce_aviso_timing
                                         lce_aviso_gliders_by_lead_fp_det[lead] = has_lce_aviso_det
@@ -3582,9 +3616,10 @@ if __name__ == "__main__":
                                             if max_m is not None:
                                                 sep_gliders_model_this_fp.append((actual_date, max_m))
                                                 sep_gliders_lce_this_fp[actual_date] = has_lce_sep
-                                        if max_a is not None and actual_date not in aviso_date_max_lat:
+                                        if max_a is not None and actual_date <= AVISO_DETACHMENT_SEPARATION_CUTOFF and actual_date not in aviso_date_max_lat:
                                             aviso_date_max_lat[actual_date] = max_a
                                             aviso_date_has_lce_sep[actual_date] = has_lce_aviso_sep
+                                            aviso_date_has_lce_det[actual_date] = has_lce_aviso_det
                             series_gliders_model.sort(key=lambda x: x[0])
                             series_gliders_aviso.sort(key=lambda x: x[0])
                             if args.timing_distribution:
@@ -3691,6 +3726,7 @@ if __name__ == "__main__":
                         if args.separation_timing or args.detachment_count:
                             aviso_date_max_lat = {}
                             aviso_date_has_lce_sep: Dict[datetime, bool] = {}
+                            aviso_date_has_lce_det: Dict[datetime, bool] = {}
                         if args.separation_timing:
                             sep_series_ref2: List = []
                             sep_series_gliders2: List = []
@@ -3723,7 +3759,7 @@ if __name__ == "__main__":
                                         series_ref_model.append((lead, max_m))
                                         lce_ref_by_lead_fp2[lead] = has_lce_timing
                                         lce_ref_by_lead_fp2_det[lead] = has_lce_det
-                                    if max_a is not None:
+                                    if max_a is not None and fs_dt + timedelta(days=lead) <= AVISO_DETACHMENT_SEPARATION_CUTOFF:
                                         series_ref_aviso.append((lead, max_a))
                                         lce_aviso_ref_by_lead_fp2[lead] = has_lce_aviso_timing
                                         lce_aviso_ref_by_lead_fp2_det[lead] = has_lce_aviso_det
@@ -3733,9 +3769,10 @@ if __name__ == "__main__":
                                             if max_m is not None:
                                                 sep_ref_model_this2.append((actual_date, max_m))
                                                 sep_ref_lce_this2[actual_date] = has_lce_sep
-                                        if max_a is not None and actual_date not in aviso_date_max_lat:
+                                        if max_a is not None and actual_date <= AVISO_DETACHMENT_SEPARATION_CUTOFF and actual_date not in aviso_date_max_lat:
                                             aviso_date_max_lat[actual_date] = max_a
                                             aviso_date_has_lce_sep[actual_date] = has_lce_aviso_sep
+                                            aviso_date_has_lce_det[actual_date] = has_lce_aviso_det
                             series_ref_model.sort(key=lambda x: x[0])
                             series_ref_aviso.sort(key=lambda x: x[0])
                             if args.timing_distribution:
@@ -3778,7 +3815,7 @@ if __name__ == "__main__":
                                         series_gliders_model.append((lead, max_m))
                                         lce_gliders_by_lead_fp2[lead] = has_lce_timing
                                         lce_gliders_by_lead_fp2_det[lead] = has_lce_det
-                                    if max_a is not None:
+                                    if max_a is not None and fs_dt + timedelta(days=lead) <= AVISO_DETACHMENT_SEPARATION_CUTOFF:
                                         series_gliders_aviso.append((lead, max_a))
                                         lce_aviso_gliders_by_lead_fp2[lead] = has_lce_aviso_timing
                                         lce_aviso_gliders_by_lead_fp2_det[lead] = has_lce_aviso_det
@@ -3788,9 +3825,10 @@ if __name__ == "__main__":
                                             if max_m is not None:
                                                 sep_gliders_model_this2.append((actual_date, max_m))
                                                 sep_gliders_lce_this2[actual_date] = has_lce_sep
-                                        if max_a is not None and actual_date not in aviso_date_max_lat:
+                                        if max_a is not None and actual_date <= AVISO_DETACHMENT_SEPARATION_CUTOFF and actual_date not in aviso_date_max_lat:
                                             aviso_date_max_lat[actual_date] = max_a
                                             aviso_date_has_lce_sep[actual_date] = has_lce_aviso_sep
+                                            aviso_date_has_lce_det[actual_date] = has_lce_aviso_det
                             series_gliders_model.sort(key=lambda x: x[0])
                             series_gliders_aviso.sort(key=lambda x: x[0])
                             if args.timing_distribution:
@@ -4338,6 +4376,7 @@ if __name__ == "__main__":
                 detachment_count_data_gliders = []
                 aviso_date_max_lat: Dict[datetime, float] = {}
                 aviso_date_has_lce_sep: Dict[datetime, bool] = {}
+                aviso_date_has_lce_det: Dict[datetime, bool] = {}
                 sep_series_ref: List[Tuple[datetime, List[Tuple[datetime, float]], Dict[datetime, bool]]] = []
                 sep_series_gliders: List[Tuple[datetime, List[Tuple[datetime, float]], Dict[datetime, bool]]] = []
 
@@ -4370,7 +4409,7 @@ if __name__ == "__main__":
                             series_model.append((lead, max_m))
                             lce_by_lead[lead] = has_lce_timing
                             lce_by_lead_det[lead] = has_lce_det
-                        if max_a is not None:
+                        if max_a is not None and fs_dt + timedelta(days=lead) <= AVISO_DETACHMENT_SEPARATION_CUTOFF:
                             series_aviso.append((lead, max_a))
                             lce_aviso_by_lead[lead] = has_lce_aviso_timing
                             lce_aviso_by_lead_det[lead] = has_lce_aviso_det
@@ -4379,9 +4418,10 @@ if __name__ == "__main__":
                             if args.separation_timing and max_m is not None:
                                 sep_model_this.append((actual_date, max_m))
                                 sep_lce_this[actual_date] = has_lce_sep
-                            if max_a is not None and actual_date not in aviso_date_max_lat:
+                            if max_a is not None and actual_date <= AVISO_DETACHMENT_SEPARATION_CUTOFF and actual_date not in aviso_date_max_lat:
                                 aviso_date_max_lat[actual_date] = max_a
                                 aviso_date_has_lce_sep[actual_date] = has_lce_aviso_sep
+                                aviso_date_has_lce_det[actual_date] = has_lce_aviso_det
                     series_model.sort(key=lambda x: x[0])
                     series_aviso.sort(key=lambda x: x[0])
                     return (series_model, series_aviso, lce_by_lead, lce_by_lead_det,
@@ -4447,7 +4487,8 @@ if __name__ == "__main__":
                 if args.separation_timing or args.detachment_count:
                     if aviso_date_max_lat:
                         aviso_det_by_ord = [(d.toordinal(), lat) for d, lat in sorted(aviso_date_max_lat.items())]
-                        aviso_total_detachments = count_detachments_from_max_lat_series(aviso_det_by_ord)
+                        aviso_lce_det_ord = {d.toordinal(): v for d, v in aviso_date_has_lce_det.items()}
+                        aviso_total_detachments = count_detachments_from_max_lat_series(aviso_det_by_ord, lead_has_lce=aviso_lce_det_ord)
                         aviso_total_detachments_from_nc = aviso_total_detachments
 
                 # --- separation timing: plot + save inline (matches --hycom pattern) ---
@@ -4663,7 +4704,8 @@ if __name__ == "__main__":
                 aviso_series_full = sorted(aviso_date_max_lat.items())
                 if aviso_series_full:
                     aviso_det_by_ord = [(d.toordinal(), lat) for d, lat in aviso_series_full]
-                    aviso_total_detachments = count_detachments_from_max_lat_series(aviso_det_by_ord)
+                    aviso_lce_det_ord = {d.toordinal(): v for d, v in (aviso_date_has_lce_det or {}).items()}
+                    aviso_total_detachments = count_detachments_from_max_lat_series(aviso_det_by_ord, lead_has_lce=aviso_lce_det_ord)
                     print(f"[Detachment count] AVISO total detachments (full time series): {aviso_total_detachments}")
             plot_detachment_counts(
                 detachment_count_data_ref or [],
